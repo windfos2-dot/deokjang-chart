@@ -149,6 +149,11 @@
     <div id="sqz-chart" style="height:140px"></div>
   </div>
 
+  <div class="panel" id="aa-panel">
+    <div class="ptitle"><span>스퀴즈 모멘텀 (AlgoAlpha)</span><span id="aa-note" class="mk"></span></div>
+    <div id="aa-chart" style="height:150px"></div>
+  </div>
+
   <div class="panel" id="flow-panel">
     <div class="ptitle"><span>수급 — 외국인 순매수</span><span id="flow-note" class="mk"></span></div>
     <div id="flow-chart" style="height:150px"></div>
@@ -189,9 +194,10 @@ const mainChart = LightweightCharts.createChart($("#main-chart"), {...COMMON, he
 const volChart  = LightweightCharts.createChart($("#vol-chart"),  {...COMMON, height:110});
 const rsiChart  = LightweightCharts.createChart($("#rsi-chart"),  {...COMMON, height:140});
 const sqzChart  = LightweightCharts.createChart($("#sqz-chart"),  {...COMMON, height:140});
+const aaChart = LightweightCharts.createChart($("#aa-chart"), {...COMMON, height:150});
 const flowChart = LightweightCharts.createChart($("#flow-chart"), {...COMMON, height:150});
 const shortChart = LightweightCharts.createChart($("#short-chart"), {...COMMON, height:140});
-const CHARTS = [mainChart, volChart, rsiChart, sqzChart, flowChart, shortChart];
+const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart, flowChart, shortChart];
 
 // 시리즈
 const candle = mainChart.addCandlestickSeries({
@@ -227,6 +233,10 @@ const SR_SERIES  = [srHi, srLo];
 const volSeries  = volChart.addHistogramSeries({priceFormat:{type:"volume"}});
 const rsiSeries  = rsiChart.addLineSeries({color:"#e6edf3", lineWidth:1, priceLineVisible:false});
 const sqzSeries  = sqzChart.addHistogramSeries({priceLineVisible:false});
+// AlgoAlpha: vf(모멘텀 라인) + zscore(백색) + 스퀴즈 상태 점
+const aaVf = aaChart.addLineSeries({lineWidth:2, priceLineVisible:false});
+const aaZ  = aaChart.addLineSeries({color:"#e8ecf1", lineWidth:1, priceLineVisible:false});
+const aaSq = aaChart.addHistogramSeries({priceLineVisible:false, lastValueVisible:false});
 const flowSeries = flowChart.addHistogramSeries({priceLineVisible:false});
 const shortQty = shortChart.addAreaSeries({
   topColor:"rgba(226,68,92,.35)", bottomColor:"rgba(226,68,92,.02)",
@@ -258,6 +268,7 @@ window.addEventListener("resize", () => {
   volChart.applyOptions({width: $("#vol-chart").clientWidth});
   rsiChart.applyOptions({width: $("#rsi-chart").clientWidth});
   sqzChart.applyOptions({width: $("#sqz-chart").clientWidth});
+  aaChart.applyOptions({width: $("#aa-chart").clientWidth});
   flowChart.applyOptions({width: $("#flow-chart").clientWidth});
   shortChart.applyOptions({width: $("#short-chart").clientWidth});
 });
@@ -296,13 +307,16 @@ function drawMarkers(){
     })));
   }
   if ($("#t-sr").checked && ind.sr) {
-    marks = marks.concat((ind.sr.breaks||[]).map(b=>({
-      time:dates[b.index],
-      position: b.direction==="up" ? "belowBar" : "aboveBar",
-      color: b.direction==="up" ? "#22c55e" : "#e2445c",
-      shape: b.direction==="up" ? "arrowUp" : "arrowDown",
-      text:"B"
-    })));
+    marks = marks.concat((ind.sr.breaks||[]).map(b=>{
+      const up = (b.type==="break_up" || b.type==="bull_wick");
+      return {
+        time:dates[b.index],
+        position: up ? "belowBar" : "aboveBar",
+        color: up ? "#22c55e" : "#e2445c",
+        shape: up ? "arrowUp" : "arrowDown",
+        text: b.label || "B"
+      };
+    }));
   }
   marks.sort((a,b)=> a.time < b.time ? -1 : 1);
   candle.setMarkers(marks);
@@ -345,19 +359,20 @@ function render(d){
   ichB.setData(pairs(dates, ich.span_b));
   ichChi.setData(pairs(dates, ich.chikou));
 
-  // S/R 계단선
+  // S/R 계단선 (LuxAlgo 원본)
   const sr = ind.sr || {};
-  srHi.setData(pairs(dates, sr.hi_use));
-  srLo.setData(pairs(dates, sr.lo_use));
+  srHi.setData(pairs(dates, sr.resistance));
+  srLo.setData(pairs(dates, sr.support));
 
-  // 오더블록 (최근 10개만, 상/하단 2선으로 박스 표현)
+  // 오더블록 (Flux 원본: 강세/약세 각 3개, 무효화된 존은 흐리게)
   clearDynamic(obSeries);
-  const obs = (ind.order_blocks||[]).slice(-10);
-  obs.forEach((b)=>{
-    const endIdx = Math.min(dates.length-1, b.index + 12);
-    const color = b.type==="bullish" ? "rgba(34,197,94,.55)" : "rgba(226,68,92,.55)";
+  const ob = ind.order_blocks || {bull:[], bear:[]};
+  [...(ob.bull||[]), ...(ob.bear||[])].forEach((b)=>{
+    const endIdx = Math.min(dates.length-1, b.index + 20);
+    const alpha = b.broken ? .22 : .6;
+    const color = b.type==="bull" ? `rgba(34,197,94,${alpha})` : `rgba(226,68,92,${alpha})`;
     [b.top, b.bottom].forEach((y)=>{
-      const s = mkLine({color, lineWidth:1, lineStyle:0});
+      const s = mkLine({color, lineWidth:1, lineStyle:b.broken?2:0});
       s.setData([{time:dates[b.index], value:y},{time:dates[endIdx], value:y}]);
       obSeries.push(s);
     });
@@ -447,6 +462,24 @@ function render(d){
     `<span>${Number(last).toLocaleString()}원</span>` +
     `<span class="chg ${chg>=0?"up":"down"}">${chg>=0?"+":""}${chg.toFixed(2)}%</span>` +
     `<span class="mk">${o.dates[0]} ~ ${o.dates[o.dates.length-1]} (${o.dates.length}봉)</span>`;
+
+  // AlgoAlpha 스퀴즈 패널
+  const aa = ind.squeeze_aa || {};
+  if (aa.vf){
+    aaVf.setData(dates.map((t,i)=>(
+      aa.vf[i]==null ? null : {time:t, value:aa.vf[i], color: aa.vf[i]>0 ? "#00ffbb" : "#ff1100"}
+    )).filter(Boolean));
+    aaZ.setData(pairs(dates, aa.zscore));
+    // 스퀴즈 상태: hyper=노랑, 압축완화=주황, 그외 회색 (원본 색상 규칙)
+    aaSq.setData(dates.map((t,i)=>{
+      if (aa.squeeze_val[i]==null) return null;
+      const relax = (aa.squeeze_ma[i]!=null) && (aa.squeeze_ma[i]-aa.squeeze_val[i] < 0);
+      return {time:t, value:2,
+              color: aa.hyper[i] ? "#facc15" : (relax ? "#fb923c" : "#5d6d7e")};
+    }).filter(Boolean));
+    const hy = aa.hyper.filter(Boolean).length;
+    $("#aa-note").textContent = `하이퍼스퀴즈 ${hy}회 · z=${aa.zscore.at(-1)==null?"-":aa.zscore.at(-1).toFixed(0)}`;
+  }
 
   renderEstimates(d.estimates, o.close[o.close.length-1]);
   loadMTF(d.ticker);       // 분봉은 별도 호출 (일봉 렌더를 막지 않도록 비동기)

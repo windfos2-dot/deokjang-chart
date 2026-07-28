@@ -35,25 +35,50 @@ def _nan_to_none(arr):
 # 이동평균류
 # ---------------------------------------------------------------------------
 def sma(x, n):
-    """단순이동평균 (period n)."""
-    x = np.asarray(x, dtype=float)
-    out = np.full(len(x), np.nan)
-    if len(x) >= n and n > 0:
-        c = np.cumsum(np.insert(x, 0, 0.0))
-        out[n - 1:] = (c[n:] - c[:-n]) / n
-    return out
+    """단순이동평균 (period n).
 
-
-def ema(x, n):
-    """지수이동평균 (period n). TradingView 관례대로 첫 n개 SMA로 시드."""
+    NaN 이 없으면 cumsum 고속 경로, 있으면 윈도우 루프(NaN 포함 윈도우는 NaN).
+    cumsum 은 NaN 을 만나면 이후 전부 오염되므로 분기가 필요하다.
+    """
     x = np.asarray(x, dtype=float)
     out = np.full(len(x), np.nan)
     if len(x) < n or n <= 0:
         return out
+    if not np.any(np.isnan(x)):
+        c = np.cumsum(np.insert(x, 0, 0.0))
+        out[n - 1:] = (c[n:] - c[:-n]) / n
+        return out
+    for i in range(n - 1, len(x)):
+        w = x[i - n + 1:i + 1]
+        if not np.any(np.isnan(w)):
+            out[i] = w.mean()
+    return out
+
+
+def ema(x, n):
+    """지수이동평균 (period n). TradingView 관례대로 첫 n개 SMA로 시드.
+
+    선행 NaN(예: lowest/highest 결과)이 있어도 첫 유효 윈도우에서 시드한다.
+    시드 이후 중간 NaN은 직전 값을 유지한다.
+    """
+    x = np.asarray(x, dtype=float)
+    out = np.full(len(x), np.nan)
+    if len(x) < n or n <= 0:
+        return out
+    start = None
+    for i in range(n - 1, len(x)):
+        if not np.any(np.isnan(x[i - n + 1:i + 1])):
+            start = i
+            break
+    if start is None:
+        return out
     alpha = 2.0 / (n + 1.0)
-    out[n - 1] = np.mean(x[:n])
-    for i in range(n, len(x)):
-        out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
+    out[start] = np.mean(x[start - n + 1:start + 1])
+    for i in range(start + 1, len(x)):
+        if np.isnan(x[i]):
+            out[i] = out[i - 1]
+        else:
+            out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
     return out
 
 
@@ -226,6 +251,307 @@ def rsi_bear_divergence(close, rsi, left=4, right=4):
 # ---------------------------------------------------------------------------
 # (d) 패턴 감지 (Trendoscope 축소판)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pine 내장함수 대응 헬퍼
+# ---------------------------------------------------------------------------
+def true_range(high, low, close):
+    """ta.tr(true) — 첫 봉은 high-low."""
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+    tr = np.empty(len(close))
+    tr[0] = high[0] - low[0]
+    for i in range(1, len(close)):
+        tr[i] = max(high[i] - low[i],
+                    abs(high[i] - close[i - 1]),
+                    abs(low[i] - close[i - 1]))
+    return tr
+
+
+def stdev(x, n):
+    """ta.stdev (모표준편차)."""
+    x = np.asarray(x, dtype=float)
+    out = np.full(len(x), np.nan)
+    for i in range(n - 1, len(x)):
+        w = x[i - n + 1:i + 1]
+        if not np.any(np.isnan(w)):
+            out[i] = np.std(w)
+    return out
+
+
+def rising(x, n):
+    """ta.rising — 최근 n봉 연속 상승이면 True."""
+    x = np.asarray(x, dtype=float)
+    out = np.zeros(len(x), dtype=bool)
+    for i in range(n, len(x)):
+        w = x[i - n:i + 1]
+        if np.any(np.isnan(w)):
+            continue
+        out[i] = bool(np.all(np.diff(w) > 0))
+    return out
+
+
+def _crossover(a, b, i):
+    """i봉에서 a가 b를 상향 돌파."""
+    if i < 1:
+        return False
+    if np.isnan(a[i]) or np.isnan(b[i]) or np.isnan(a[i - 1]) or np.isnan(b[i - 1]):
+        return False
+    return a[i] > b[i] and a[i - 1] <= b[i - 1]
+
+
+def _crossunder(a, b, i):
+    if i < 1:
+        return False
+    if np.isnan(a[i]) or np.isnan(b[i]) or np.isnan(a[i - 1]) or np.isnan(b[i - 1]):
+        return False
+    return a[i] < b[i] and a[i - 1] >= b[i - 1]
+
+
+# ---------------------------------------------------------------------------
+# Squeeze Momentum Oscillator [AlgoAlpha] 이식
+# ---------------------------------------------------------------------------
+# 출처: TradingView 공개 오픈소스 (script/WDsx1YV1). Pine 복사 아닌 재작성.
+# LazyBear 판(squeeze_momentum)과는 완전히 다른 지표다.
+def squeeze_algoalpha(high, low, close, mom_len=10, swing_len=20,
+                      sq_period=14, sq_smooth=7, sq_ema=14, hyper_len=5):
+    """AlgoAlpha 스퀴즈 모멘텀.
+
+    - 스퀴즈: ATR 대비 EMA(ATR) 차이를 고저폭으로 정규화 -> 변동성 압축도
+    - 모멘텀(vf): 추세방향(고/저 EMA 돌파 상태)에 따른 기준선 대비 거리의 HMA
+    - zscore: vf 를 20봉 z-score 로 정규화 후 EMA, ×66 스케일
+    """
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+    n = len(close)
+
+    # --- 스퀴즈 ---
+    atr = ema(true_range(high, low, close), sq_period)
+    ema_atr = ema(atr, sq_period * 2)
+    volatility = ema_atr - atr
+    hl = high - low
+    ema_hl = ema(hl, sq_period * 2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        raw = volatility / ema_hl * 100.0
+    sq_val = ema(raw, sq_smooth)
+    sq_ma = ema(sq_val, sq_ema)
+    hyper = rising(sq_val, hyper_len) & (sq_val > 0)
+
+    # --- 모멘텀 ---
+    lowest_l = np.full(n, np.nan)
+    highest_h = np.full(n, np.nan)
+    for i in range(mom_len - 1, n):
+        lowest_l[i] = np.min(low[i - mom_len + 1:i + 1])
+        highest_h[i] = np.max(high[i - mom_len + 1:i + 1])
+    l_line = ema(lowest_l, mom_len)
+    h_line = ema(highest_h, mom_len)
+
+    d = np.zeros(n, dtype=int)
+    cur = 0
+    for i in range(n):
+        if _crossover(close, h_line, i):
+            cur = 1
+        elif _crossunder(close, l_line, i):
+            cur = -1
+        d[i] = cur
+
+    val = np.where(d == 1, l_line, h_line)
+    val1 = close - val
+    val2 = hma(val1, mom_len)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        vf = (val2 / ema(hl, mom_len * 2) * 100.0) / 8.0
+
+    # --- z-score ---
+    basis = sma(vf, swing_len)
+    sd = stdev(vf, swing_len)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = (vf - basis) / sd
+    z = ema(z, swing_len) * 66.0
+
+    return {
+        "vf": _nan_to_none(vf),
+        "zscore": _nan_to_none(z),
+        "squeeze_val": _nan_to_none(sq_val),
+        "squeeze_ma": _nan_to_none(sq_ma),
+        "hyper": [bool(x) for x in hyper],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Support and Resistance Levels with Breaks [LuxAlgo] 이식
+# ---------------------------------------------------------------------------
+# 출처: TradingView 공개 오픈소스 (script/JDFoWQbL). Pine 복사 아닌 재작성.
+def sr_breaks_luxalgo(open_, high, low, close, volume,
+                      left_bars=15, right_bars=15, vol_thresh=20.0):
+    """LuxAlgo S/R + 돌파 신호.
+
+    저항/지지 = pivothigh/pivotlow(left,right) 를 fixnan 으로 이어 붙인 선.
+    돌파는 거래량 오실레이터(EMA5 vs EMA10)가 임계 초과일 때만 'B',
+    캔들 꼬리가 길면 'Bull/Bear Wick' 으로 구분한다.
+    """
+    open_ = np.asarray(open_, dtype=float)
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+    volume = np.asarray(volume, dtype=float)
+    n = len(close)
+
+    # 피봇 (확정은 right_bars 뒤, 원본은 추가로 [1] 시프트)
+    ph = np.full(n, np.nan)
+    pl = np.full(n, np.nan)
+    for i in range(left_bars, n - right_bars):
+        c = high[i]
+        if all(c > high[i - j] for j in range(1, left_bars + 1)) and \
+           all(c > high[i + j] for j in range(1, right_bars + 1)):
+            ph[i + right_bars] = c
+        c2 = low[i]
+        if all(c2 < low[i - j] for j in range(1, left_bars + 1)) and \
+           all(c2 < low[i + j] for j in range(1, right_bars + 1)):
+            pl[i + right_bars] = c2
+
+    def _fixnan_shift1(src):
+        out = np.full(n, np.nan)
+        last = np.nan
+        for i in range(n):
+            prev = src[i - 1] if i >= 1 else np.nan
+            if not np.isnan(prev):
+                last = prev
+            out[i] = last
+        return out
+
+    res = _fixnan_shift1(ph)      # 저항
+    sup = _fixnan_shift1(pl)      # 지지
+
+    short_v = ema(volume, 5)
+    long_v = ema(volume, 10)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        osc = 100.0 * (short_v - long_v) / long_v
+
+    breaks = []
+    for i in range(1, n):
+        strong = (not np.isnan(osc[i])) and osc[i] > vol_thresh
+        up = _crossover(close, res, i)
+        dn = _crossunder(close, sup, i)
+        if up:
+            bull_wick = (open_[i] - low[i]) > (close[i] - open_[i])
+            if bull_wick:
+                breaks.append({"index": i, "type": "bull_wick", "label": "Bull Wick",
+                               "price": float(close[i])})
+            elif strong:
+                breaks.append({"index": i, "type": "break_up", "label": "B",
+                               "price": float(close[i])})
+        if dn:
+            bear_wick = (open_[i] - close[i]) < (high[i] - open_[i])
+            if bear_wick:
+                breaks.append({"index": i, "type": "bear_wick", "label": "Bear Wick",
+                               "price": float(close[i])})
+            elif strong:
+                breaks.append({"index": i, "type": "break_down", "label": "B",
+                               "price": float(close[i])})
+
+    return {"resistance": _nan_to_none(res), "support": _nan_to_none(sup),
+            "vol_osc": _nan_to_none(osc), "breaks": breaks}
+
+
+# ---------------------------------------------------------------------------
+# Order Blocks [Flux Charts] 이식
+# ---------------------------------------------------------------------------
+# 출처: TradingView 공개 오픈소스 (script/bLdpFVuq). Pine 복사 아닌 재작성.
+def order_blocks_flux(high, low, close, volume, swing_length=10,
+                      max_atr_mult=3.5, max_blocks=3, invalidation="Wick"):
+    """Flux 방식 오더블록 (거래량 정보 포함).
+
+    스윙 고점을 종가가 돌파하면, 스윙~현재 구간에서 저점이 가장 낮은 봉의
+    low~high 를 강세 오더블록으로 잡는다(약세는 대칭). 블록 높이가
+    ATR(10)×3.5 를 넘으면 버린다. 거래량은 최근 3봉 합.
+    """
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+    volume = np.asarray(volume, dtype=float)
+    n = len(close)
+    if n < swing_length + 3:
+        return {"bull": [], "bear": []}
+
+    atr = ema(true_range(high, low, close), 10)
+
+    bull, bear = [], []
+    swing_type = 0
+    top = bottom = None            # (index, price)
+    top_crossed = bottom_crossed = True
+
+    for i in range(swing_length, n):
+        upper = np.max(high[i - swing_length + 1:i + 1])
+        lower = np.min(low[i - swing_length + 1:i + 1])
+        j = i - swing_length
+        prev_type = swing_type
+        if high[j] > upper:
+            swing_type = 0
+        elif low[j] < lower:
+            swing_type = 1
+        if swing_type == 0 and prev_type != 0:
+            top = (j, high[j])
+            top_crossed = False
+        if swing_type == 1 and prev_type != 1:
+            bottom = (j, low[j])
+            bottom_crossed = False
+
+        # --- 강세 오더블록 ---
+        if top is not None and not top_crossed and close[i] > top[1]:
+            top_crossed = True
+            box_btm = high[i - 1]
+            box_top = low[i - 1]
+            span = i - top[0] - 1
+            for k in range(1, max(span, 1)):
+                idx = i - k
+                if idx < 0:
+                    break
+                if low[idx] < box_btm:
+                    box_btm = low[idx]
+                    box_top = high[idx]
+            size = abs(box_top - box_btm)
+            if not np.isnan(atr[i]) and size <= atr[i] * max_atr_mult and size > 0:
+                bull.insert(0, {
+                    "index": int(i), "top": float(box_top), "bottom": float(box_btm),
+                    "volume": float(volume[i] + volume[i - 1] + volume[i - 2]),
+                    "type": "bull",
+                })
+                bull[:] = bull[:max_blocks]
+
+        # --- 약세 오더블록 ---
+        if bottom is not None and not bottom_crossed and close[i] < bottom[1]:
+            bottom_crossed = True
+            box_top = low[i - 1]
+            box_btm = high[i - 1]
+            span = i - bottom[0] - 1
+            for k in range(1, max(span, 1)):
+                idx = i - k
+                if idx < 0:
+                    break
+                if high[idx] > box_top:
+                    box_top = high[idx]
+                    box_btm = low[idx]
+            size = abs(box_top - box_btm)
+            if not np.isnan(atr[i]) and size <= atr[i] * max_atr_mult and size > 0:
+                bear.insert(0, {
+                    "index": int(i), "top": float(box_top), "bottom": float(box_btm),
+                    "volume": float(volume[i] + volume[i - 1] + volume[i - 2]),
+                    "type": "bear",
+                })
+                bear[:] = bear[:max_blocks]
+
+    # 무효화 판정 (Wick=꼬리, Close=종가 기준)
+    for blk in bull:
+        ref = low if invalidation == "Wick" else close
+        blk["broken"] = bool(np.any(ref[blk["index"]:] < blk["bottom"]))
+    for blk in bear:
+        ref = high if invalidation == "Wick" else close
+        blk["broken"] = bool(np.any(ref[blk["index"]:] > blk["top"]))
+
+    return {"bull": bull, "bear": bear}
+
+
 # ---------------------------------------------------------------------------
 # Trendoscope 원본 알고리즘 이식 (ACP)
 # ---------------------------------------------------------------------------
@@ -1037,18 +1363,21 @@ def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0,
     out["minervini"] = minervini_trend_template(close, lookback=260,
                                                 benchmark_close=benchmark_close)
 
-    # --- S/R 레벨 + 돌파 (LuxAlgo 로직) ---
-    sr = support_resistance_breaks(open_, high, low, close, volume,
-                                   left=15, right=15, vol_thresh=sr_vol_thresh)
+    # --- S/R 레벨 + 돌파 (LuxAlgo 원본 이식) ---
+    lux = sr_breaks_luxalgo(open_, high, low, close, volume,
+                            left_bars=15, right_bars=15, vol_thresh=sr_vol_thresh)
     out["sr"] = {
-        "levels": sr["levels"],
-        "breaks": sr["breaks"],
-        "hi_use": _nan_to_none(sr["hi_use"]),
-        "lo_use": _nan_to_none(sr["lo_use"]),
+        "resistance": lux["resistance"],
+        "support": lux["support"],
+        "breaks": lux["breaks"],
+        "vol_osc": lux["vol_osc"],
     }
 
-    # --- 오더블록 ---
-    out["order_blocks"] = order_blocks(open_, high, low, close, volume)
+    # --- 오더블록 (Flux 원본 이식) ---
+    out["order_blocks"] = order_blocks_flux(high, low, close, volume)
+
+    # --- AlgoAlpha 스퀴즈 (LazyBear 판과 별개 지표) ---
+    out["squeeze_aa"] = squeeze_algoalpha(high, low, close)
 
     return out
 
