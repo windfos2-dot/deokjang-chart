@@ -35,6 +35,8 @@ from datetime import datetime, timedelta
 import numpy as np
 
 import chart_indicators as ind
+# import 만으로 .env 를 로드해 KRX 로그인이 걸린다(한국 지수 조회에 필요).
+import chart_data_loader as loader  # noqa: F401
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DOCS = os.path.join(ROOT, "docs")
@@ -281,6 +283,87 @@ def us_collect(symbols, batch=200):
 
 
 # ---------------------------------------------------------------------------
+# 지수
+# ---------------------------------------------------------------------------
+# 한국 지수는 pykrx(KRX 로그인 필요), 해외는 yfinance.
+KR_INDICES = [
+    ("1001", "코스피"),
+    ("1028", "코스피200"),
+    ("2001", "코스닥"),
+    ("2203", "코스닥150"),
+]
+WORLD_INDICES = [
+    ("^N225", "닛케이225"),
+    ("^GSPC", "S&P 500"),
+    ("^IXIC", "나스닥 종합"),
+    ("^RUI", "러셀1000"),
+    ("^RUT", "러셀2000"),
+    ("^RUA", "러셀3000"),
+    ("000300.SS", "CSI 300"),
+    ("^HSI", "항셍"),
+    ("^TWII", "대만 가권"),
+]
+
+
+def collect_indices():
+    """지수 시계열 수집. 반환: {code: (name, series)}"""
+    out = {}
+
+    # --- 한국 (pykrx) ---
+    try:
+        from pykrx import stock
+        frm = (datetime.now() - timedelta(days=int(BARS * 1.7))).strftime("%Y%m%d")
+        to = datetime.now().strftime("%Y%m%d")
+        for code, name in KR_INDICES:
+            try:
+                df = stock.get_index_ohlcv_by_date(frm, to, code)
+                if df is None or df.empty:
+                    continue
+                df = df.tail(BARS)
+                out["IDX" + code] = (name, {
+                    "dates": [d.strftime("%Y-%m-%d") for d in df.index],
+                    "open": df["시가"].astype(float).tolist(),
+                    "high": df["고가"].astype(float).tolist(),
+                    "low": df["저가"].astype(float).tolist(),
+                    "close": df["종가"].astype(float).tolist(),
+                    "volume": df["거래량"].astype(float).tolist()
+                    if "거래량" in df.columns else [0.0] * len(df),
+                })
+                log(f"[IDX] {name} {len(df)}일")
+            except Exception as e:  # noqa: BLE001
+                log(f"[IDX] {name} 실패: {e}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[IDX] 한국 지수 건너뜀(KRX 로그인 필요): {e}")
+
+    # --- 해외 (yfinance) ---
+    try:
+        import yfinance as yf
+        syms = [s for s, _ in WORLD_INDICES]
+        df = yf.download(syms, period="18mo", interval="1d", progress=False,
+                         auto_adjust=False, threads=True)
+        for sym, name in WORLD_INDICES:
+            try:
+                sub = df.xs(sym, axis=1, level=1).dropna().tail(BARS)
+                if len(sub) < 60:
+                    continue
+                out[sym] = (name, {
+                    "dates": [d.strftime("%Y-%m-%d") for d in sub.index],
+                    "open": sub["Open"].astype(float).tolist(),
+                    "high": sub["High"].astype(float).tolist(),
+                    "low": sub["Low"].astype(float).tolist(),
+                    "close": sub["Close"].astype(float).tolist(),
+                    "volume": sub["Volume"].astype(float).tolist(),
+                })
+                log(f"[IDX] {name} {len(sub)}일")
+            except Exception as e:  # noqa: BLE001
+                log(f"[IDX] {name} 실패: {e}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[IDX] 해외 지수 실패: {e}")
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 종목 1개 -> JSON
 # ---------------------------------------------------------------------------
 def build_one(code, name, market, s, with_supply=False):
@@ -306,12 +389,9 @@ def build_one(code, name, market, s, with_supply=False):
         "o": rlist(o, px_nd), "h": rlist(h, px_nd),
         "l": rlist(lo, px_nd), "c": rlist(c, px_nd),
         "v": [int(x) if x is not None else None for x in v],
-        "ma": {k: rlist(r[k], px_nd) for k in
-               ("sma5", "sma10", "sma20", "sma50", "sma120", "sma150", "sma200",
-                "ema50", "ema200", "hma60")},
-        "bb": {k: rlist(r["bb_" + k], px_nd) for k in ("mid", "upper", "lower")},
-        "rsi": rlist(r["rsi"], 1),
-        "disparity50": rlist(r["disparity50"], 2),
+        # ma / bb / rsi / disparity / ichimoku 는 내려보내지 않는다.
+        # OHLCV 만으로 만들 수 있어 docs/indicators.js 가 브라우저에서 계산한다
+        # (파이썬과 값 일치 검증 완료). 종목당 용량 약 61% 절감.
         "squeeze": {"val": rlist(r["squeeze"]["val"], 1),
                     "color": r["squeeze"]["color"]},
         "squeeze_aa": {"vf": rlist(r["squeeze_aa"]["vf"], 2),
@@ -319,7 +399,6 @@ def build_one(code, name, market, s, with_supply=False):
                        "squeeze_val": rlist(r["squeeze_aa"]["squeeze_val"], 2),
                        "squeeze_ma": rlist(r["squeeze_aa"]["squeeze_ma"], 2),
                        "hyper": r["squeeze_aa"]["hyper"]},
-        "ichimoku": {k: rlist(r["ichimoku"][k], px_nd) for k in r.get("ichimoku", {})} if r.get("ichimoku") else None,
         "rsi_bear_div": r["rsi_bear_div"],
         "patterns": r["patterns"],
         "zigzag": r["zigzag"],
@@ -348,6 +427,18 @@ def main():
 
     index = []
     t_start = time.time()
+
+    # ---- 지수 (검색 상단에 오도록 먼저) ----
+    os.makedirs(os.path.join(DATA, "IDX"), exist_ok=True)
+    for code, (name, s) in collect_indices().items():
+        doc = build_one(code, name, "지수", s)
+        if not doc:
+            continue
+        safe = code.replace("^", "_").replace(".", "_")
+        with open(os.path.join(DATA, "IDX", f"{safe}.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
+        index.append({"t": safe, "n": name, "m": "지수", "r": "IDX"})
+    log(f"[IDX] 완료 {len(index)}개")
 
     # ---- 한국 ----
     if not args.skip_kr:

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>덕장 차트</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+  // CDN 한 곳이 죽어도 차트가 뜨도록 폴백
+  if (typeof LightweightCharts === "undefined") {
+    document.write('<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"><\/script>');
+  }
+</script>
+<script src="indicators.js"></script>
+<style>
+  :root{--bg:#0b0e13;--panel:#121722;--border:#1e2634;--text:#e8ecf1;--muted:#8b97a8;
+        --up:#e2445c;--dn:#3b82f6;--accent:#2dd4bf}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:13px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Segoe UI",sans-serif}
+  header{display:flex;gap:14px;align-items:center;padding:10px 14px;
+         border-bottom:1px solid var(--border);background:var(--panel);
+         position:sticky;top:0;z-index:50;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;white-space:nowrap}
+  .search{position:relative;flex:1;min-width:220px;max-width:420px}
+  #q{width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
+     background:#0e131c;color:var(--text);font-size:13px}
+  #drop{position:absolute;top:38px;left:0;right:0;background:var(--panel);
+        border:1px solid var(--border);border-radius:6px;max-height:340px;overflow-y:auto;
+        display:none;z-index:60}
+  #drop div{padding:7px 10px;cursor:pointer;display:flex;gap:8px;font-size:12px}
+  #drop div:hover{background:#1b2432}
+  #drop .code{color:var(--muted);font-variant-numeric:tabular-nums}
+  #drop .mk{margin-left:auto;color:var(--muted);font-size:11px}
+  .quote{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .quote b{font-size:15px}
+  .up{color:var(--up)} .dn{color:var(--dn)}
+  #meta{color:var(--muted);font-size:11px;margin-left:auto}
+  main{padding:10px 14px 40px}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+         margin-bottom:10px;overflow:hidden}
+  .ptitle{padding:6px 10px;font-size:11.5px;color:var(--muted);
+          border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+  #mnv{font-size:12px;padding:6px 14px 0;color:var(--muted)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:600;font-size:11.5px}
+  .badge.ok{background:#0f3f33;color:#4ade80} .badge.no{background:#3f1620;color:#f87171}
+  .crit{display:inline-block;margin:2px 3px 0 0;padding:1px 6px;border-radius:4px;
+        background:#1b2432;font-size:11px}
+  .crit.y{color:#4ade80} .crit.n{color:#f87171}
+  .toolbar{display:flex;gap:12px;flex-wrap:wrap;padding:8px 14px;font-size:12px;color:var(--muted)}
+  .toolbar label{display:flex;gap:5px;align-items:center;cursor:pointer;
+                 background:var(--panel);border:1px solid var(--border);
+                 padding:4px 9px;border-radius:6px}
+  #empty{padding:60px 20px;text-align:center;color:var(--muted)}
+  footer{padding:14px;color:var(--muted);font-size:11px;text-align:center;
+         border-top:1px solid var(--border)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>덕장 차트</h1>
+  <div class="search">
+    <input id="q" placeholder="종목명 또는 코드 (예: 삼성전자, 005930, NVDA)" autocomplete="off">
+    <div id="drop"></div>
+  </div>
+  <div class="quote" id="quote"></div>
+  <div id="meta"></div>
+</header>
+
+<div class="toolbar">
+  <label><input type="checkbox" id="t-ma" checked> 이동평균</label>
+  <label><input type="checkbox" id="t-bb" checked> 볼린저(20,2)</label>
+  <label><input type="checkbox" id="t-hma" checked> HMA(60)</label>
+  <label><input type="checkbox" id="t-ich"> 이치모쿠</label>
+  <label><input type="checkbox" id="t-pat" checked> ACP 패턴</label>
+  <label><input type="checkbox" id="t-sr" checked> S/R + 돌파</label>
+  <label><input type="checkbox" id="t-ob"> 오더블록</label>
+  <label><input type="checkbox" id="t-div" checked> RSI 다이버전스</label>
+</div>
+<div id="mnv"></div>
+
+<main>
+  <div id="empty">종목을 검색하세요.</div>
+  <div id="charts" style="display:none">
+    <div class="panel"><div class="ptitle"><span>가격 · 이동평균 · 볼린저 · 패턴</span><span id="leg"></span></div>
+      <div id="main-chart" style="height:430px"></div><div id="patlist" style="padding:6px 10px"></div></div>
+    <div class="panel"><div class="ptitle"><span>거래량</span></div><div id="vol-chart" style="height:110px"></div></div>
+    <div class="panel"><div class="ptitle"><span>RSI(14) · Bear 다이버전스 ▼</span></div><div id="rsi-chart" style="height:130px"></div></div>
+    <div class="panel"><div class="ptitle"><span>스퀴즈 모멘텀 (LazyBear)</span></div><div id="sqz-chart" style="height:130px"></div></div>
+    <div class="panel"><div class="ptitle"><span>스퀴즈 모멘텀 (AlgoAlpha)</span><span id="aa-note"></span></div><div id="aa-chart" style="height:140px"></div></div>
+  </div>
+</main>
+
+<footer>
+  정적 스냅샷 · 데이터 <span id="built"></span> · 투자 판단의 근거로 쓰지 마세요
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const pairs = (d, a) => d.map((t,i)=> (a && a[i]!=null) ? {time:t, value:a[i]} : null).filter(Boolean);
+
+let INDEX = [], CUR = null;
+const COMMON = {
+  // 패널이 display:none 인 상태에서 생성되면 폭이 300px 로 고정된다.
+  // autoSize 는 ResizeObserver 로 컨테이너 크기를 따라간다.
+  autoSize:true,
+  layout:{background:{color:"transparent"}, textColor:"#8b97a8", fontSize:11},
+  grid:{vertLines:{color:"#151b26"}, horzLines:{color:"#151b26"}},
+  rightPriceScale:{borderColor:"#1e2634"},
+  timeScale:{borderColor:"#1e2634", rightOffset:6},
+  crosshair:{mode:0}
+};
+
+const mainChart = LightweightCharts.createChart($("#main-chart"), {...COMMON, height:430});
+const volChart  = LightweightCharts.createChart($("#vol-chart"),  {...COMMON, height:110});
+const rsiChart  = LightweightCharts.createChart($("#rsi-chart"),  {...COMMON, height:130});
+const sqzChart  = LightweightCharts.createChart($("#sqz-chart"),  {...COMMON, height:130});
+const aaChart   = LightweightCharts.createChart($("#aa-chart"),   {...COMMON, height:140});
+const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart];
+
+const candle = mainChart.addCandlestickSeries({
+  upColor:"#e2445c", downColor:"#3b82f6", borderUpColor:"#e2445c",
+  borderDownColor:"#3b82f6", wickUpColor:"#e2445c", wickDownColor:"#3b82f6"});
+const mkLine = o => mainChart.addLineSeries({priceLineVisible:false, lastValueVisible:false, ...o});
+const ma20=mkLine({color:"#f0b90b",lineWidth:1}), ma50=mkLine({color:"#a78bfa",lineWidth:1}),
+      ma120=mkLine({color:"#2dd4bf",lineWidth:1});
+const bbU=mkLine({color:"#8b97a8",lineWidth:1,lineStyle:2}), bbL=mkLine({color:"#8b97a8",lineWidth:1,lineStyle:2}),
+      bbM=mkLine({color:"#8b97a8",lineWidth:1,lineStyle:2});
+const hmaS=mkLine({color:"#38bdf8",lineWidth:2});
+const ichA=mkLine({color:"#4ade80",lineWidth:1}), ichB=mkLine({color:"#f87171",lineWidth:1}),
+      ichT=mkLine({color:"#fbbf24",lineWidth:1}), ichK=mkLine({color:"#60a5fa",lineWidth:1});
+const srHi=mkLine({color:"#e2445c",lineWidth:2}), srLo=mkLine({color:"#3b82f6",lineWidth:2});
+const MA=[ma20,ma50,ma120], BB=[bbU,bbL,bbM], ICH=[ichA,ichB,ichT,ichK], SR=[srHi,srLo];
+
+const volSeries = volChart.addHistogramSeries({priceLineVisible:false});
+const rsiSeries = rsiChart.addLineSeries({color:"#e8ecf1",lineWidth:1,priceLineVisible:false});
+const sqzSeries = sqzChart.addHistogramSeries({priceLineVisible:false});
+const aaVf = aaChart.addLineSeries({lineWidth:2,priceLineVisible:false});
+const aaZ  = aaChart.addLineSeries({color:"#e8ecf1",lineWidth:1,priceLineVisible:false});
+[70,30].forEach(v=>rsiSeries.createPriceLine({price:v,color:"#3a4658",lineWidth:1,lineStyle:2,axisLabelVisible:false}));
+
+// 시간축 동기화
+let syncing=false;
+CHARTS.forEach(src=>src.timeScale().subscribeVisibleLogicalRangeChange(r=>{
+  if(syncing||!r) return; syncing=true;
+  CHARTS.forEach(t=>{ if(t!==src) t.timeScale().setVisibleLogicalRange(r); });
+  syncing=false;
+}));
+
+let dynamic=[];
+function clearDynamic(){ dynamic.forEach(s=>{try{mainChart.removeSeries(s)}catch(e){}}); dynamic=[]; }
+
+async function loadIndex(){
+  const r = await fetch("index.json");
+  INDEX = await r.json();
+  try{ const m = await (await fetch("meta.json")).json();
+       $("#built").textContent = (m.built_at||"").replace("T"," ");
+       $("#meta").textContent = `${m.count.toLocaleString()}종목`; }catch(e){}
+}
+
+$("#q").addEventListener("input", e=>{
+  const q = e.target.value.trim().toLowerCase();
+  const dd = $("#drop");
+  if(!q){ dd.style.display="none"; return; }
+  const hits = INDEX.filter(x => x.t.toLowerCase().includes(q) || (x.n||"").toLowerCase().includes(q)).slice(0,30);
+  dd.innerHTML = hits.map(x=>`<div data-t="${x.t}" data-r="${x.r}">
+      <span class="code">${x.t}</span><span>${x.n}</span><span class="mk">${x.m}</span></div>`).join("");
+  dd.style.display = hits.length ? "block" : "none";
+});
+$("#drop").addEventListener("click", e=>{
+  const el = e.target.closest("div[data-t]"); if(!el) return;
+  $("#drop").style.display="none"; $("#q").value="";
+  load(el.dataset.r, el.dataset.t);
+});
+document.addEventListener("click", e=>{ if(!e.target.closest(".search")) $("#drop").style.display="none"; });
+
+async function load(region, ticker){
+  let d;
+  try{ d = await (await fetch(`data/${region}/${ticker}.json`)).json(); }
+  catch(err){ alert("데이터 없음: "+ticker); return; }
+  CUR = d;
+  $("#empty").style.display="none"; $("#charts").style.display="block";
+  dispatchEvent(new Event("resize"));   // 숨김 상태에서 만들어진 차트는 폭이 0이다
+  render(d);
+}
+
+function render(d){
+  const A = DJIndicators.computeArrays(d);     // 배열 지표는 브라우저에서 계산
+  const dates = d.dates;
+
+  candle.setData(dates.map((t,i)=>({time:t, open:d.o[i], high:d.h[i], low:d.l[i], close:d.c[i]})));
+  ma20.setData(pairs(dates,A.ma.sma20)); ma50.setData(pairs(dates,A.ma.sma50)); ma120.setData(pairs(dates,A.ma.sma120));
+  bbU.setData(pairs(dates,A.bb.upper)); bbL.setData(pairs(dates,A.bb.lower)); bbM.setData(pairs(dates,A.bb.mid));
+  hmaS.setData(pairs(dates,A.ma.hma60));
+  ichA.setData(pairs(dates,A.ichimoku.span_a)); ichB.setData(pairs(dates,A.ichimoku.span_b));
+  ichT.setData(pairs(dates,A.ichimoku.tenkan)); ichK.setData(pairs(dates,A.ichimoku.kijun));
+  srHi.setData(pairs(dates,d.sr?.resistance)); srLo.setData(pairs(dates,d.sr?.support));
+
+  volSeries.setData(dates.map((t,i)=>({time:t, value:d.v[i],
+    color: d.c[i]>=d.o[i] ? "rgba(226,68,92,.5)":"rgba(59,130,246,.5)"})));
+  rsiSeries.setData(pairs(dates,A.rsi));
+  sqzSeries.setData(dates.map((t,i)=> d.squeeze.val[i]==null?null:
+    ({time:t, value:d.squeeze.val[i], color:d.squeeze.color[i]})).filter(Boolean));
+
+  const aa = d.squeeze_aa||{};
+  if(aa.vf){
+    aaVf.setData(dates.map((t,i)=> aa.vf[i]==null?null:
+      ({time:t, value:aa.vf[i], color: aa.vf[i]>0?"#00ffbb":"#ff1100"})).filter(Boolean));
+    aaZ.setData(pairs(dates,aa.zscore));
+    $("#aa-note").textContent = `하이퍼스퀴즈 ${(aa.hyper||[]).filter(Boolean).length}회`;
+  }
+
+  // 패턴선 + 오더블록
+  clearDynamic();
+  if($("#t-pat").checked) (d.patterns||[]).forEach(p=>{
+    [["upper","#f0b90b"],["lower","#38bdf8"]].forEach(([k,c])=>{
+      const s = mkLine({color:c, lineWidth:2, lineStyle:2});
+      s.setData([{time:dates[p[k].x1],value:p[k].y1},{time:dates[p[k].x2],value:p[k].y2}]);
+      dynamic.push(s);
+    });
+  });
+  if($("#t-ob").checked){
+    const ob = d.order_blocks||{bull:[],bear:[]};
+    [...(ob.bull||[]),...(ob.bear||[])].forEach(b=>{
+      const end = Math.min(dates.length-1, b.index+20);
+      const al = b.broken?.22:.6;
+      const col = b.type==="bull"?`rgba(34,197,94,${al})`:`rgba(226,68,92,${al})`;
+      [b.top,b.bottom].forEach(y=>{
+        const s = mkLine({color:col,lineWidth:1,lineStyle:b.broken?2:0});
+        s.setData([{time:dates[b.index],value:y},{time:dates[end],value:y}]); dynamic.push(s);
+      });
+    });
+  }
+  $("#patlist").innerHTML = ($("#t-pat").checked? (d.patterns||[]):[]).map(p=>
+    `<span class="crit">${p.name} ${dates[p.start]}~${dates[p.end]}</span>`).join(" ");
+
+  // 마커
+  let marks=[];
+  if($("#t-div").checked) marks = marks.concat((d.rsi_bear_div||[]).map(i=>
+    ({time:dates[i],position:"aboveBar",color:"#e2445c",shape:"arrowDown",text:"Bear"})));
+  if($("#t-sr").checked) marks = marks.concat((d.sr?.breaks||[]).map(b=>{
+    const up = b.type==="break_up"||b.type==="bull_wick";
+    return {time:dates[b.index],position:up?"belowBar":"aboveBar",
+            color:up?"#22c55e":"#e2445c",shape:up?"arrowUp":"arrowDown",text:b.label||"B"};
+  }));
+  marks.sort((a,b)=> a.time<b.time?-1:1);
+  candle.setMarkers(marks);
+
+  // 헤더 시세
+  const last=d.c[d.c.length-1], first=d.c[0], chg=(last/first-1)*100;
+  $("#quote").innerHTML = `<b>${d.name}</b> <span style="color:var(--muted)">${d.ticker} · ${d.market}</span>
+     <b>${last.toLocaleString()}</b> <span class="${chg>=0?'up':'dn'}">${chg>=0?'+':''}${chg.toFixed(2)}%</span>`;
+
+  // 미너비니
+  const mv = d.minervini;
+  if(mv){
+    const L={c1_above_ma150_ma200:"종가>150·200MA",c2_ma150_above_ma200:"150MA>200MA",
+      c3_ma200_rising_1m:"200MA 상승",c4_ma50_above_ma150_ma200:"50MA>150·200MA",
+      c5_close_above_ma50:"종가>50MA",c6_above_52w_low_30pct:"52주저가+30%↑",
+      c7_within_25pct_of_52w_high:"52주고가-25%내",c8_rs_rating_70:"RS≥70"};
+    $("#mnv").innerHTML = `<span class="badge ${mv.pass?'ok':'no'}">Minervini 추세템플릿 ${mv.pass?'통과':'미충족'}</span> ` +
+      Object.keys(L).map(k=> mv[k]==null?"" :
+        `<span class="crit ${mv[k]?'y':'n'}">${mv[k]?'✓':'✗'} ${L[k]}</span>`).join("");
+  } else $("#mnv").innerHTML="";
+
+  applyToggles();
+  // autoSize 의 ResizeObserver 는 비동기라, 폭이 확정된 다음 프레임에 맞춘다
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    CHARTS.forEach(c=>c.timeScale().fitContent());
+  }));
+}
+
+function applyToggles(){
+  MA.forEach(s=>s.applyOptions({visible:$("#t-ma").checked}));
+  BB.forEach(s=>s.applyOptions({visible:$("#t-bb").checked}));
+  ICH.forEach(s=>s.applyOptions({visible:$("#t-ich").checked}));
+  SR.forEach(s=>s.applyOptions({visible:$("#t-sr").checked}));
+  hmaS.applyOptions({visible:$("#t-hma").checked});
+}
+document.querySelectorAll(".toolbar input").forEach(cb=>
+  cb.addEventListener("change", ()=>{ if(CUR) render(CUR); }));
+
+addEventListener("resize", ()=>{
+  mainChart.applyOptions({width:$("#main-chart").clientWidth});
+  volChart.applyOptions({width:$("#vol-chart").clientWidth});
+  rsiChart.applyOptions({width:$("#rsi-chart").clientWidth});
+  sqzChart.applyOptions({width:$("#sqz-chart").clientWidth});
+  aaChart.applyOptions({width:$("#aa-chart").clientWidth});
+});
+
+loadIndex().then(()=>{ dispatchEvent(new Event("resize")); });
+</script>
+</body>
+</html>
