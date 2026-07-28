@@ -226,6 +226,237 @@ def rsi_bear_divergence(close, rsi, left=4, right=4):
 # ---------------------------------------------------------------------------
 # (d) 패턴 감지 (Trendoscope 축소판)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Trendoscope 원본 알고리즘 이식 (ACP)
+# ---------------------------------------------------------------------------
+# 출처: TradingView 공개 오픈소스
+#   - Auto Chart Patterns [Trendoscope®]  (script/WZ8B1FIW)
+#   - ZigzagLite (library, script/lJXwpXtt)
+#   - basechartpatterns (library, script/95AW01ki)
+# Pine 코드를 복사한 것이 아니라 알고리즘을 파이썬으로 재작성했다.
+# 원저작자: Trendoscope. TradingView 공개 스크립트는 통상 MPL-2.0 이다.
+#
+# ⚠️ 앞서 쓰던 퍼센트 편차(dev=4.5%) 지그재그와는 알고리즘이 다르다.
+#    원본은 ta.highestbars/lowestbars 기반 피봇 방식이다.
+
+ZZ_LENGTH = 8          # 원본 기본값 (zigzagLength1)
+ZZ_DEPTH = 55          # 원본 기본값 (depth1) — 보관할 최대 피봇 수
+FLAT_RATIO = 0.20      # flatThreshold 20% -> ratio
+ERROR_THRESHOLD = 0.20  # errorThresold 20%
+BAR_RATIO_LIMIT = 0.382  # barRatioLimit
+
+
+def zigzag_pivots(high, low, length=ZZ_LENGTH, depth=ZZ_DEPTH):
+    """Trendoscope ZigzagLite 방식 지그재그.
+
+    각 봉에서 최근 length 봉 중 최고/최저이면 피봇 후보가 된다.
+    같은 방향에서 더 극단적인 값이 나오면 직전 피봇을 교체(removeOld)하고,
+    반대 방향이면 새 피봇을 추가한다.
+
+    반환: [(index, price, 'H'|'L'), ...]  (오래된 것 -> 최신 순)
+    """
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    n = len(high)
+    if n < length + 1:
+        return []
+
+    # pivots: 최신이 앞 (Pine 의 unshift 구조와 동일). 각 항목 [index, price, dir]
+    # dir: +1 = 고점 피봇, -1 = 저점 피봇
+    pivots = []
+
+    for i in range(length - 1, n):
+        w = slice(i - length + 1, i + 1)
+        hw, lw = high[w], low[w]
+        p_high, p_low = float(hw.max()), float(lw.min())
+        # ta.highestbars == 0 <=> 현재 봉이 구간 최고
+        p_high_bar0 = bool(high[i] >= p_high)
+        p_low_bar0 = bool(low[i] <= p_low)
+
+        p_dir = 1
+        last = None
+        if pivots:
+            last = pivots[0]
+            p_dir = 1 if last[2] > 0 else -1
+
+        force_double = False
+        if len(pivots) > 1:
+            llast = pivots[1]
+            if p_dir == 1 and p_low_bar0:
+                force_double = p_low < llast[1]
+            elif p_dir == -1 and p_high_bar0:
+                force_double = p_high > llast[1]
+
+        new_pivot = False
+        # 1) 같은 방향 연장 -> 직전 피봇 교체
+        if pivots and ((p_dir == 1 and p_high_bar0) or (p_dir == -1 and p_low_bar0)):
+            value = p_high if p_dir == 1 else p_low
+            if value * p_dir >= last[1] * p_dir:
+                pivots.pop(0)
+                pivots.insert(0, [i, value, p_dir])
+                new_pivot = True
+
+        # 2) 반대 방향 -> 새 피봇 추가
+        opposite = (p_dir == 1 and p_low_bar0) or (p_dir == -1 and p_high_bar0)
+        if opposite and (not new_pivot or force_double):
+            value = p_low if p_dir == 1 else p_high
+            pivots.insert(0, [i, value, -p_dir])
+
+        if len(pivots) > depth:
+            pivots = pivots[:depth]
+
+    out = [(int(p[0]), float(p[1]), "H" if p[2] > 0 else "L") for p in pivots]
+    out.reverse()                      # 과거 -> 최신
+    return out
+
+
+_PATTERN_NAMES = {
+    1: "상승채널", 2: "하락채널", 3: "횡보채널",
+    4: "상승쐐기확장", 5: "하락쐐기확장", 6: "발산삼각형",
+    7: "상승삼각형확장", 8: "하락삼각형확장",
+    9: "상승쐐기수축", 10: "하락쐐기수축", 11: "수렴삼각형",
+    12: "하락삼각형수축", 13: "상승삼각형수축",
+}
+
+
+def resolve_pattern_type(t1p1, t1p2, t2p1, t2p2, i1, i2, flat_ratio=FLAT_RATIO):
+    """basechartpatterns.resolvePatternName 이식. 반환 patternType (0=무효).
+
+    t1 = 상단 추세선, t2 = 하단 추세선. p1 = 시작, p2 = 끝.
+    """
+    # 상/하단선의 방향을 '각도비'로 판정 (원본과 동일한 비율식)
+    if t1p1 > t2p1:
+        base = min(t2p1, t2p2)
+        upper_angle = (t1p2 - base) / (t1p1 - base) if (t1p1 - base) else 1.0
+        base2 = max(t1p1, t1p2)
+        lower_angle = (t2p2 - base2) / (t2p1 - base2) if (t2p1 - base2) else 1.0
+    else:
+        base = min(t1p1, t1p2)
+        upper_angle = (t2p2 - base) / (t2p1 - base) if (t2p1 - base) else 1.0
+        base2 = max(t2p1, t2p2)
+        lower_angle = (t1p2 - base2) / (t1p1 - base2) if (t1p1 - base2) else 1.0
+
+    hi = 1 + flat_ratio
+    lo = 1 - flat_ratio
+    upper_dir = 1 if upper_angle > hi else (-1 if upper_angle < lo else 0)
+    # 원본에서 하단선은 부호가 반전되어 있다
+    lower_dir = -1 if lower_angle > hi else (1 if lower_angle < lo else 0)
+
+    start_diff = abs(t1p1 - t2p1)
+    end_diff = abs(t1p2 - t2p2)
+    min_diff = min(start_diff, end_diff)
+    bar_diff = i2 - i1
+    if bar_diff <= 0:
+        return 0, upper_dir, lower_dir
+    price_diff = abs(start_diff - end_diff) / bar_diff
+
+    # 두 선이 만나기까지 걸릴 봉 수. 패턴 폭의 2배보다 크면 사실상 평행 -> 채널
+    conv_bars = (min_diff / price_diff) if price_diff else float("inf")
+
+    expanding = end_diff > start_diff
+    contracting = end_diff < start_diff
+    is_channel = (conv_bars > 2 * bar_diff
+                  or (not expanding and not contracting)
+                  or (upper_dir == 0 and lower_dir == 0))
+    invalid = np.sign(t1p1 - t2p1) != np.sign(t1p2 - t2p2)   # 선이 교차 -> 무효
+
+    if invalid:
+        t = 0
+    elif is_channel:
+        if upper_dir > 0 and lower_dir > 0:
+            t = 1
+        elif upper_dir < 0 and lower_dir < 0:
+            t = 2
+        else:
+            t = 3
+    elif expanding:
+        if upper_dir > 0 and lower_dir > 0:
+            t = 4
+        elif upper_dir < 0 and lower_dir < 0:
+            t = 5
+        elif upper_dir > 0 and lower_dir < 0:
+            t = 6
+        elif upper_dir > 0 and lower_dir == 0:
+            t = 7
+        elif upper_dir == 0 and lower_dir < 0:
+            t = 8
+        else:
+            t = 0
+    elif contracting:
+        if upper_dir > 0 and lower_dir > 0:
+            t = 9
+        elif upper_dir < 0 and lower_dir < 0:
+            t = 10
+        elif upper_dir < 0 and lower_dir > 0:
+            t = 11
+        elif lower_dir == 0:
+            t = 12 if upper_dir < 0 else 1
+        elif upper_dir == 0:
+            t = 13 if lower_dir > 0 else 2
+        else:
+            t = 0
+    else:
+        t = 0
+    return t, upper_dir, lower_dir
+
+
+def detect_patterns_trendoscope(pivots, close, num_pivots=5,
+                                error_threshold=ERROR_THRESHOLD,
+                                flat_ratio=FLAT_RATIO, avoid_overlap=True):
+    """Trendoscope ACP 방식 패턴 감지 (5 또는 6 피봇 슬라이딩 윈도우)."""
+    close = np.asarray(close, dtype=float)
+    patterns = []
+    if len(pivots) < num_pivots or len(close) == 0:
+        return patterns
+
+    for s in range(0, len(pivots) - num_pivots + 1):
+        win = pivots[s:s + num_pivots]
+        highs = [(i, p) for (i, p, t) in win if t == "H"]
+        lows = [(i, p) for (i, p, t) in win if t == "L"]
+        if len(highs) < 2 or len(lows) < 2:
+            continue
+
+        hb, ha = _fit_line([x[0] for x in highs], [x[1] for x in highs])
+        lb, la = _fit_line([x[0] for x in lows], [x[1] for x in lows])
+        i1, i2 = win[0][0], win[-1][0]
+        if i2 <= i1:
+            continue
+
+        t1p1, t1p2 = ha + hb * i1, ha + hb * i2      # 상단선
+        t2p1, t2p2 = la + lb * i1, la + lb * i2      # 하단선
+
+        # 검증: 각 피봇이 자기 추세선에서 errorThreshold 이내인가
+        span = max(abs(t1p1 - t2p1), abs(t1p2 - t2p2))
+        if span <= 0:
+            continue
+        tol = span * error_threshold
+        if any(abs(p - (ha + hb * i)) > tol for (i, p) in highs):
+            continue
+        if any(abs(p - (la + lb * i)) > tol for (i, p) in lows):
+            continue
+
+        ptype, ud, ld = resolve_pattern_type(t1p1, t1p2, t2p1, t2p2, i1, i2, flat_ratio)
+        if ptype <= 0:
+            continue
+
+        patterns.append({
+            "name": _PATTERN_NAMES.get(ptype, str(ptype)),
+            "type_id": ptype,
+            "start": int(i1), "end": int(i2),
+            "upper": {"x1": int(i1), "y1": float(t1p1), "x2": int(i2), "y2": float(t1p2)},
+            "lower": {"x1": int(i1), "y1": float(t2p1), "x2": int(i2), "y2": float(t2p2)},
+        })
+
+    if not avoid_overlap:
+        return patterns
+    kept, last_end = [], -1
+    for p in sorted(patterns, key=lambda z: z["start"]):
+        if p["start"] > last_end:
+            kept.append(p)
+            last_end = p["end"]
+    return kept
+
+
 def zigzag(high, low, dev=0.045):
     """퍼센트 지그재그. dev 이상 역행 시 직전 극값을 피봇 확정.
 
@@ -784,10 +1015,11 @@ def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0,
 
     out["rsi_bear_div"] = rsi_bear_divergence(close, rsi)
 
-    pivots = zigzag(high, low, 0.045)
+    # 패턴/지그재그는 Trendoscope 원본 알고리즘 사용 (퍼센트 편차 방식은 과검출)
+    pivots = zigzag_pivots(high, low, ZZ_LENGTH, ZZ_DEPTH)
     out["zigzag"] = [{"index": int(i), "price": float(pr), "type": t}
                      for (i, pr, t) in pivots]
-    out["patterns"] = detect_patterns(pivots, close)
+    out["patterns"] = detect_patterns_trendoscope(pivots, close)
 
     # --- 이치모쿠 (9,26,52,26) ---
     ich = ichimoku(high, low, close)
