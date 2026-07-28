@@ -42,7 +42,26 @@
   .chg.up{color:var(--up)} .chg.down{color:var(--down)}
   #banner{display:none;padding:8px 18px;background:#3b2a12;color:#f5c77e;
           font-size:12.5px;border-bottom:1px solid #5a4320}
-  main{padding:10px 14px 40px}
+  main{padding:10px 14px 40px; margin-right:330px}
+  @media (max-width:1100px){ main{margin-right:0} #side{position:static;width:auto;height:auto} }
+  #side{position:fixed; right:0; top:0; width:320px; height:100vh; overflow-y:auto;
+        background:var(--panel); border-left:1px solid var(--border); padding:12px;
+        z-index:40; font-size:12px}
+  #side h3{font-size:12.5px;margin:0 0 8px;color:var(--text);font-weight:600;
+           display:flex;justify-content:space-between;align-items:center;gap:6px}
+  #side .sub{color:var(--muted);font-size:11px;font-weight:400}
+  #est-table{width:100%;border-collapse:collapse;font-size:11px}
+  #est-table th,#est-table td{padding:4px 5px;text-align:right;border-bottom:1px solid #1b2432;
+                              white-space:nowrap}
+  #est-table th{color:var(--muted);font-weight:500}
+  #est-table td:first-child,#est-table th:first-child{text-align:left}
+  #est-table tr.est{background:rgba(45,212,191,.07)}
+  #est-table tr.est td:first-child{color:var(--accent);font-weight:600}
+  .op{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600}
+  .op.buy{background:#0f3f33;color:#4ade80} .op.hold{background:#3a3320;color:#f0c674}
+  .warn{margin-top:8px;padding:7px 8px;border-radius:6px;background:#3b2a12;
+        color:#f5c77e;font-size:10.5px;line-height:1.45}
+  .muted-note{color:var(--muted);font-size:10.5px;margin-top:6px;line-height:1.4}
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;
          margin-bottom:10px;overflow:hidden}
   .ptitle{font-size:12px;color:var(--muted);padding:7px 12px;border-bottom:1px solid var(--border);
@@ -131,6 +150,11 @@
     <div id="short-chart" style="height:140px"></div>
   </div>
 </main>
+
+<aside id="side">
+  <h3>포워드 컨센서스 <span class="sub" id="est-meta"></span></h3>
+  <div id="est-body"><div class="muted-note">불러오는 중…</div></div>
+</aside>
 
 <script>
 // ===== EMS 주소 주입 =====
@@ -412,8 +436,69 @@ function render(d){
     `<span class="chg ${chg>=0?"up":"down"}">${chg>=0?"+":""}${chg.toFixed(2)}%</span>` +
     `<span class="mk">${o.dates[0]} ~ ${o.dates[o.dates.length-1]} (${o.dates.length}봉)</span>`;
 
+  renderEstimates(d.estimates, o.close[o.close.length-1]);
   applyToggles();          // 마커 + 시리즈 표시상태 일괄 적용
   mainChart.timeScale().fitContent();
+}
+
+// ---- 우측: 포워드 컨센서스 ----
+const eok = (v) => {           // 억원 -> 읽기 쉬운 표기
+  if (v === null || v === undefined) return "-";
+  const a = Math.abs(v);
+  if (a >= 10000) return (v/10000).toFixed(1) + "조";
+  return Math.round(v).toLocaleString() + "억";
+};
+const num = (v, d=2) => (v === null || v === undefined) ? "-" : v.toFixed(d);
+
+function renderEstimates(est, lastClose){
+  const body = $("#est-body"), meta = $("#est-meta");
+  if (!est || !est.available){
+    meta.textContent = "";
+    body.innerHTML = `<div class="muted-note">${est?.reason || "데이터 없음"}</div>`;
+    return;
+  }
+  const opCls = /매수|Buy|강력/.test(est.opinion||"") ? "buy" : "hold";
+  const ed = est.est_date ? `${est.est_date.slice(0,4)}-${est.est_date.slice(4,6)}-${est.est_date.slice(6)}` : "-";
+  meta.innerHTML = est.opinion ? `<span class="op ${opCls}">${est.opinion}</span>` : "";
+
+  const rows = est.rows.map(r=>`
+    <tr class="${r.is_estimate?'est':''}">
+      <td>${r.period}</td>
+      <td>${eok(r.revenue)}</td>
+      <td>${eok(r.op_profit)}</td>
+      <td>${num(r.op_margin,1)}%</td>
+      <td>${num(r.per,1)}</td>
+      <td>${num(r.pbr,2)}</td>
+    </tr>`).join("");
+
+  // 추정 구간 요약
+  const e1 = est.rows.find(r=>r.is_estimate);
+  const summary = e1 ? `
+    <div style="display:flex;gap:8px;margin:8px 0 6px">
+      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
+        <div class="sub">${e1.period} PER</div>
+        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.per,1)}배</div>
+      </div>
+      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
+        <div class="sub">${e1.period} PBR</div>
+        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.pbr,2)}배</div>
+      </div>
+    </div>` : "";
+
+  body.innerHTML = summary + `
+    <table id="est-table">
+      <tr><th>기간</th><th>매출</th><th>영업익</th><th>OPM</th><th>PER</th><th>PBR</th></tr>
+      ${rows}
+    </table>
+    <div class="muted-note">
+      시총 ${eok(est.mktcap_eok)} · 자본 ${eok(est.equity_eok)} · 추정일 ${ed}${est.analyst?` · ${est.analyst}`:""}
+    </div>
+    <div class="muted-note">${est.pbr_note}</div>
+    <div class="warn">
+      ⚠️ <b>E 행은 증권사 추정치</b>입니다. 실적이 아니며 컨센서스는 자주 바뀝니다.
+      포워드 배수는 현재 시가총액 ÷ 추정치라, 추정이 틀리면 배수도 틀립니다.
+      숫자가 이례적이면 원자료(리포트)를 직접 확인하세요.
+    </div>`;
 }
 
 // ---- API ----

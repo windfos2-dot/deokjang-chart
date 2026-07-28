@@ -150,6 +150,12 @@ def full(ticker: str = Query(..., min_length=6, max_length=6),
     except Exception as e:  # noqa: BLE001
         payload["shorting"] = {"available": False, "reason": f"공매도 조회 실패: {e}"}
 
+    # --- 옵션: 포워드 컨센서스 + 포워드 PER/PBR ---
+    try:
+        payload["estimates"] = loader.get_forward_estimates(ticker)
+    except Exception as e:  # noqa: BLE001
+        payload["estimates"] = {"available": False, "reason": f"추정실적 조회 실패: {e}"}
+
     # --- 옵션: 신용잔고 (bld 미확정 -> 항상 비활성) ---
     try:
         payload["credit"] = loader.get_credit_balance(ticker, days=days)

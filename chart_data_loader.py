@@ -214,6 +214,143 @@ def get_trading_kis(ticker, days=KIS_MAX_DAYS):
     }
 
 
+def _kis_get(path, tr_id, params, timeout=20):
+    r = requests.get(
+        f"{_KIS_BASE}{path}",
+        headers={"authorization": f"Bearer {_kis_token()}",
+                 "appkey": os.getenv("KIS_APP_KEY"),
+                 "appsecret": os.getenv("KIS_APP_SECRET"),
+                 "tr_id": tr_id},
+        params=params, timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _f(v):
+    """KIS 문자열 숫자 -> float. 결측(99.99 등 자리표시자 포함) 처리."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x
+
+
+def get_forward_estimates(ticker):
+    """컨센서스 추정실적 + 현재 시가총액 기준 포워드 PER/PBR.
+
+    소스: KIS 종목추정실적(HHKST668300C0) + 대차대조표(FHKST66430100).
+    단위는 KIS 관례대로 억원.
+
+    ⚠️ 응답 구조 주의(실측):
+      - output4: 기간 라벨 5개. 'E' 접미사가 붙은 것이 추정치.
+      - output2: 항상 6행 = [매출액, 매출증감률, 영업이익, 영업이익증감률,
+                            순이익, 순이익증감률]. 증감률은 ×10 스케일.
+      - output3: 행 수가 종목마다 다르다(3행/8행 실측). PER 등을 인덱스로
+        집으면 종목에 따라 엉뚱한 값을 읽으므로 사용하지 않고 직접 계산한다.
+      - 커버리지 없는 종목은 output 자체가 비어온다(예: 086520).
+    """
+    key = ("fwd", ticker)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    if not kis_configured():
+        return {"available": False, "reason": "KIS_APP_KEY / KIS_APP_SECRET 미설정"}
+
+    try:
+        d = _kis_get("/uapi/domestic-stock/v1/quotations/estimate-perform",
+                     "HHKST668300C0", {"SHT_CD": ticker})
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"추정실적 조회 실패: {e}"}
+
+    o1 = d.get("output1") or {}
+    o2 = d.get("output2") or []
+    o4 = d.get("output4") or []
+    if not o4 or len(o2) < 5:
+        return {"available": False,
+                "reason": "증권사 컨센서스 커버리지 없음(추정치 미제공 종목)"}
+
+    periods = [x.get("dt", "") for x in o4]
+    cols = [f"data{i}" for i in range(1, len(periods) + 1)]
+
+    def row(idx):
+        if idx >= len(o2):
+            return [None] * len(periods)
+        return [_f(o2[idx].get(c)) for c in cols]
+
+    revenue = row(0)          # 매출액 (억원)
+    op_profit = row(2)        # 영업이익 (억원)
+    net_income = row(4)       # 순이익 (억원)
+
+    # --- 현재 시가총액 (억원) ---
+    mktcap_eok = None
+    cap_src = None
+    try:
+        df = stock.get_market_cap_by_ticker(_today_str(), market="ALL")
+        if ticker in df.index:
+            mktcap_eok = float(df.loc[ticker, "시가총액"]) / 1e8
+            cap_src = "KRX"
+    except Exception:  # noqa: BLE001
+        pass
+    if mktcap_eok is None:                      # 폴백: 종가 × 상장주식수
+        try:
+            o = get_ohlcv(ticker, days=30)
+            shares = _f(o1.get("capital"))      # capital = 자본금(억), 주식수 아님 → 사용불가
+            raise RuntimeError("상장주식수 미확보")
+        except Exception as e:  # noqa: BLE001
+            return {"available": False, "reason": f"시가총액 조회 실패: {e}"}
+
+    # --- 최근 자본총계 (억원) ---
+    equity = None
+    try:
+        bs = _kis_get("/uapi/domestic-stock/v1/finance/balance-sheet", "FHKST66430100",
+                      {"FID_DIV_CLS_CODE": "0", "fid_cond_mrkt_div_code": "J",
+                       "fid_input_iscd": ticker}).get("output") or []
+        if bs:
+            equity = _f(bs[0].get("total_cptl"))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- 포워드 배수 계산 ---
+    rows = []
+    cum_ni = 0.0
+    for i, p in enumerate(periods):
+        ni = net_income[i]
+        is_est = p.endswith("E")
+        if ni is not None:
+            cum_ni += ni
+        per = (mktcap_eok / ni) if (ni and ni > 0) else None
+        # 추정 자본 = 최근 자본총계 + 추정 순이익 누계 (배당 미반영 → 근사)
+        pbr = None
+        if equity:
+            eq_i = equity + (cum_ni if is_est else 0.0)
+            pbr = mktcap_eok / eq_i if eq_i > 0 else None
+        opm = (op_profit[i] / revenue[i] * 100) if (revenue[i] and op_profit[i] is not None) else None
+        rows.append({
+            "period": p, "is_estimate": is_est,
+            "revenue": revenue[i], "op_profit": op_profit[i], "net_income": ni,
+            "op_margin": opm, "per": per, "pbr": pbr,
+        })
+
+    out = {
+        "available": True,
+        "ticker": ticker,
+        "name": o1.get("item_kor_nm"),
+        "opinion": o1.get("rcmd_name") or None,
+        "est_date": o1.get("estdate") or None,
+        "analyst": o1.get("name1") or None,
+        "mktcap_eok": mktcap_eok,
+        "mktcap_src": cap_src,
+        "equity_eok": equity,
+        "unit": "억원",
+        "rows": rows,
+        "pbr_note": "포워드 PBR은 (최근 자본총계 + 추정 순이익 누계) 기준 근사치(배당 미반영)",
+    }
+    _ttl_set(key, out)
+    return out
+
+
 class KrxLoginRequired(RuntimeError):
     """KRX 로그인이 없어 데이터를 못 받은 경우. 라우터가 사유를 프론트로 전달한다."""
 
