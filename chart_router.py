@@ -40,6 +40,59 @@ _HTML_PATH = os.path.join(_BASE_DIR, "static", "chart_live.html")
 # ---------------------------------------------------------------------------
 # 상태
 # ---------------------------------------------------------------------------
+@router.get("/mtf")
+def mtf(ticker: str = Query(..., min_length=6, max_length=6)):
+    """멀티타임프레임 신호 (5분 / 60분 / 일봉).
+
+    분봉은 KIS 전용이라 KIS 미설정이면 일봉만 반환한다.
+    """
+    frames = []
+
+    # --- 일봉 (pykrx) ---
+    try:
+        o = loader.get_ohlcv(ticker, days=280)
+        sig = ind.timeframe_signals(o["high"], o["low"], o["close"], o["volume"])
+        sig["tf"] = "일봉"
+        frames.append(sig)
+    except Exception as e:  # noqa: BLE001
+        frames.append({"tf": "일봉", "available": False, "reason": str(e)})
+
+    # --- 분봉 (KIS) ---
+    if loader.kis_configured():
+        for minutes, label in ((5, "5분"), (60, "60분")):
+            try:
+                bars = loader.get_intraday(ticker, tf_minutes=minutes, bars=80)
+                sig = ind.timeframe_signals([b["h"] for b in bars],
+                                            [b["l"] for b in bars],
+                                            [b["c"] for b in bars],
+                                            [b["v"] for b in bars])
+                sig["tf"] = label
+                sig["last_dt"] = bars[-1]["dt"] if bars else None
+                frames.append(sig)
+            except Exception as e:  # noqa: BLE001
+                frames.append({"tf": label, "available": False, "reason": str(e)})
+    else:
+        for label in ("5분", "60분"):
+            frames.append({"tf": label, "available": False,
+                           "reason": "KIS 미설정 (분봉은 KIS 전용)"})
+
+    order = {"5분": 0, "60분": 1, "일봉": 2}
+    frames.sort(key=lambda f: order.get(f.get("tf"), 9))
+    return {"ticker": ticker, "frames": frames}
+
+
+@router.get("/intraday")
+def intraday(ticker: str = Query(..., min_length=6, max_length=6),
+             tf: int = Query(5, ge=1, le=240),
+             bars: int = Query(120, ge=10, le=400)):
+    """N분봉 OHLCV (KIS 전용)."""
+    try:
+        data = loader.get_intraday(ticker, tf_minutes=tf, bars=bars)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"분봉 조회 실패: {e}") from e
+    return {"ticker": ticker, "tf_minutes": tf, "bars": data}
+
+
 @router.get("/health")
 def health():
     """모듈 상태 + KRX 로그인 게이트 상태."""

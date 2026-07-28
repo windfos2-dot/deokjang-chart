@@ -678,6 +678,78 @@ def order_blocks(open_, high, low, close, volume, swing=5, move_bars=3, min_move
 # ---------------------------------------------------------------------------
 # 통합 계산
 # ---------------------------------------------------------------------------
+def timeframe_signals(high, low, close, volume=None):
+    """단일 타임프레임 요약 신호. 멀티타임프레임 패널용.
+
+    반환: dict(close, chg_pct, ma20, above_ma20, rsi, rsi_state,
+              squeeze_val, squeeze_dir, verdict, score)
+    """
+    close = np.asarray(close, dtype=float)
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    n = len(close)
+    if n < 2:
+        return {"available": False, "reason": "봉 부족"}
+
+    last = float(close[-1])
+    prev = float(close[-2])
+    chg = (last / prev - 1.0) * 100.0 if prev else None
+
+    ma20 = sma(close, 20)
+    ma20_last = float(ma20[-1]) if n >= 20 and not np.isnan(ma20[-1]) else None
+    above = bool(last > ma20_last) if ma20_last is not None else None
+
+    r = rsi_wilder(close, 14)
+    rsi_last = float(r[-1]) if n > 14 and not np.isnan(r[-1]) else None
+    if rsi_last is None:
+        rsi_state = None
+    elif rsi_last >= 70:
+        rsi_state = "과매수"
+    elif rsi_last <= 30:
+        rsi_state = "과매도"
+    else:
+        rsi_state = "중립"
+
+    sq_val = sq_dir = None
+    if n >= 40:
+        sv = squeeze_momentum(high, low, close, 20)
+        if not np.isnan(sv[-1]):
+            sq_val = float(sv[-1])
+            prev_v = sv[-2] if not np.isnan(sv[-2]) else sv[-1]
+            sq_dir = "상승" if sv[-1] > prev_v else "하락"
+
+    # 종합 점수: MA / RSI / 스퀴즈 각각 ±1
+    score = 0
+    if above is True:
+        score += 1
+    elif above is False:
+        score -= 1
+    if rsi_last is not None:
+        if rsi_last >= 55:
+            score += 1
+        elif rsi_last <= 45:
+            score -= 1
+    if sq_val is not None:
+        score += 1 if sq_val >= 0 else -1
+
+    verdict = "강세" if score >= 2 else ("약세" if score <= -2 else "중립")
+
+    return {
+        "available": True,
+        "close": float(last),
+        "chg_pct": float(chg) if chg is not None else None,
+        "ma20": ma20_last,
+        "above_ma20": above,
+        "rsi": rsi_last,
+        "rsi_state": rsi_state,
+        "squeeze_val": sq_val,
+        "squeeze_dir": sq_dir,
+        "score": int(score),
+        "verdict": verdict,
+        "bars": int(n),
+    }
+
+
 def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0,
                 benchmark_close=None):
     """OHLCV -> 전체 지표 dict (JSON 직렬화 가능).

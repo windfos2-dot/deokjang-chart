@@ -57,6 +57,15 @@
   #est-table td:first-child,#est-table th:first-child{text-align:left}
   #est-table tr.est{background:rgba(45,212,191,.07)}
   #est-table tr.est td:first-child{color:var(--accent);font-weight:600}
+  #mtf-table{width:100%;border-collapse:collapse;font-size:11px}
+  #mtf-table th,#mtf-table td{padding:5px;text-align:right;border-bottom:1px solid #1b2432;white-space:nowrap}
+  #mtf-table th{color:var(--muted);font-weight:500}
+  #mtf-table td:first-child,#mtf-table th:first-child{text-align:left;font-weight:600}
+  .vd{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10.5px;font-weight:600}
+  .vd.bull{background:#0f3f33;color:#4ade80}
+  .vd.bear{background:#3f1620;color:#f87171}
+  .vd.flat{background:#26303f;color:#9aa7b8}
+  .up{color:#f87171} .dn{color:#60a5fa}
   .op{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600}
   .op.buy{background:#0f3f33;color:#4ade80} .op.hold{background:#3a3320;color:#f0c674}
   .warn{margin-top:8px;padding:7px 8px;border-radius:6px;background:#3b2a12;
@@ -152,6 +161,9 @@
 </main>
 
 <aside id="side">
+  <h3>멀티타임프레임 <span class="sub" id="mtf-meta"></span></h3>
+  <div id="mtf-body"><div class="muted-note">불러오는 중…</div></div>
+  <div style="height:14px"></div>
   <h3>포워드 컨센서스 <span class="sub" id="est-meta"></span></h3>
   <div id="est-body"><div class="muted-note">불러오는 중…</div></div>
 </aside>
@@ -437,8 +449,50 @@ function render(d){
     `<span class="mk">${o.dates[0]} ~ ${o.dates[o.dates.length-1]} (${o.dates.length}봉)</span>`;
 
   renderEstimates(d.estimates, o.close[o.close.length-1]);
+  loadMTF(d.ticker);       // 분봉은 별도 호출 (일봉 렌더를 막지 않도록 비동기)
   applyToggles();          // 마커 + 시리즈 표시상태 일괄 적용
   mainChart.timeScale().fitContent();
+}
+
+// ---- 우측: 멀티타임프레임 ----
+async function loadMTF(ticker){
+  const body = $("#mtf-body"), meta = $("#mtf-meta");
+  body.innerHTML = `<div class="muted-note">불러오는 중…</div>`;
+  let d;
+  try {
+    const r = await fetch(`${API_BASE}/api/chart/mtf?ticker=${ticker}`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    d = await r.json();
+  } catch(e){
+    meta.textContent = "";
+    body.innerHTML = `<div class="muted-note">조회 실패: ${e.message}</div>`;
+    return;
+  }
+  const cls = v => v==="강세" ? "bull" : (v==="약세" ? "bear" : "flat");
+  const rows = d.frames.map(f=>{
+    if(!f.available){
+      return `<tr><td>${f.tf}</td><td colspan="4" style="text-align:left;color:var(--muted);font-size:10px">
+              ${(f.reason||"데이터 없음").slice(0,32)}</td></tr>`;
+    }
+    const chg = f.chg_pct==null ? "-" :
+      `<span class="${f.chg_pct>=0?'up':'dn'}">${f.chg_pct>=0?'+':''}${f.chg_pct.toFixed(2)}%</span>`;
+    return `<tr>
+      <td>${f.tf}</td>
+      <td>${chg}</td>
+      <td>${f.above_ma20==null?'-':(f.above_ma20?'<span class="up">위</span>':'<span class="dn">아래</span>')}</td>
+      <td>${f.rsi==null?'-':f.rsi.toFixed(0)}</td>
+      <td><span class="vd ${cls(f.verdict)}">${f.verdict}</span></td>
+    </tr>`;
+  }).join("");
+
+  const ok = d.frames.filter(f=>f.available);
+  const agree = ok.length && ok.every(f=>f.verdict===ok[0].verdict) ? ok[0].verdict : null;
+  meta.innerHTML = agree ? `<span class="vd ${cls(agree)}">${agree} 일치</span>` : "";
+
+  body.innerHTML = `<table id="mtf-table">
+      <tr><th>TF</th><th>등락</th><th>MA20</th><th>RSI</th><th>판정</th></tr>${rows}
+    </table>
+    <div class="muted-note">판정 = MA20·RSI·스퀴즈 3지표 합산(±3). 분봉은 KIS, 일봉은 KRX.</div>`;
 }
 
 // ---- 우측: 포워드 컨센서스 ----

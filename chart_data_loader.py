@@ -351,6 +351,116 @@ def get_forward_estimates(ticker):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 분봉 (멀티타임프레임) — KIS 전용. pykrx 는 일봉만 제공한다.
+# ---------------------------------------------------------------------------
+# KIS 일별분봉(FHKST03010230)은 호출당 1분봉 120건을 주며, 지정 시각에서
+# 과거로 내려가다 날짜 경계를 자동으로 넘어간다(실측 확인).
+_INTRADAY_URL = "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"
+_INTRADAY_TR = "FHKST03010230"
+_INTRADAY_PER_CALL = 120
+_INTRADAY_MAX_CALLS = 40          # 폭주 방지 상한 (≈4800 분봉)
+
+
+def _minus_one_minute(date_str, hhmmss):
+    dt = datetime.strptime(date_str + hhmmss[:4], "%Y%m%d%H%M") - timedelta(minutes=1)
+    return dt.strftime("%Y%m%d"), dt.strftime("%H%M") + "00"
+
+
+def get_intraday_1m(ticker, need_bars=600):
+    """1분봉을 과거로 페이지네이션하며 수집. 오래된 것 -> 최신 순으로 반환.
+
+    반환: [{"dt": "YYYY-MM-DD HH:MM", "o","h","l","c","v"}, ...]
+    """
+    if not kis_configured():
+        raise RuntimeError("KIS_APP_KEY / KIS_APP_SECRET 미설정 (분봉은 KIS 전용)")
+
+    key = ("i1m", ticker, need_bars)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    seen = {}
+    cur_date, cur_hour = _today_str(), "153000"
+    calls = 0
+    while len(seen) < need_bars and calls < _INTRADAY_MAX_CALLS:
+        calls += 1
+        try:
+            d = _kis_get(_INTRADAY_URL, _INTRADAY_TR, {
+                "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
+                "FID_INPUT_DATE_1": cur_date, "FID_INPUT_HOUR_1": cur_hour,
+                "FID_PW_DATA_INCU_YN": "Y", "FID_FAKE_TICK_INCU_YN": "",
+            })
+        except Exception as e:  # noqa: BLE001
+            if not seen:
+                raise RuntimeError(f"분봉 조회 실패: {e}") from e
+            break
+
+        rows = d.get("output2") or []
+        if not rows:
+            break
+
+        for it in rows:
+            ds, hs = it.get("stck_bsop_date", ""), it.get("stck_cntg_hour", "")
+            if len(ds) != 8 or len(hs) < 4:
+                continue
+            stamp = f"{ds[:4]}-{ds[4:6]}-{ds[6:]} {hs[:2]}:{hs[2:4]}"
+            if stamp in seen:
+                continue
+            try:
+                seen[stamp] = {
+                    "dt": stamp,
+                    "o": float(it.get("stck_oprc", 0) or 0),
+                    "h": float(it.get("stck_hgpr", 0) or 0),
+                    "l": float(it.get("stck_lwpr", 0) or 0),
+                    "c": float(it.get("stck_prpr", 0) or 0),
+                    "v": float(it.get("cntg_vol", 0) or 0),
+                }
+            except (TypeError, ValueError):
+                continue
+
+        last = rows[-1]
+        nd, nh = _minus_one_minute(last.get("stck_bsop_date"), last.get("stck_cntg_hour"))
+        if (nd, nh) == (cur_date, cur_hour):     # 진행 없음 -> 무한루프 방지
+            break
+        cur_date, cur_hour = nd, nh
+
+    bars = [seen[k] for k in sorted(seen)]
+    bars = [b for b in bars if b["c"] > 0]
+    _ttl_set(key, bars)
+    return bars
+
+
+def resample_bars(bars, minutes):
+    """1분봉 -> N분봉 집계. 한국장 09:00 기준 정시 경계로 버킷팅."""
+    out = {}
+    for b in bars:
+        date_part, time_part = b["dt"].split(" ")
+        hh, mm = int(time_part[:2]), int(time_part[3:5])
+        total = hh * 60 + mm
+        bucket = (total // minutes) * minutes
+        label = f"{date_part} {bucket // 60:02d}:{bucket % 60:02d}"
+        cur = out.get(label)
+        if cur is None:
+            out[label] = {"dt": label, "o": b["o"], "h": b["h"],
+                          "l": b["l"], "c": b["c"], "v": b["v"]}
+        else:
+            cur["h"] = max(cur["h"], b["h"])
+            cur["l"] = min(cur["l"], b["l"])
+            cur["c"] = b["c"]           # bars 가 시간순이므로 마지막이 종가
+            cur["v"] += b["v"]
+    return [out[k] for k in sorted(out)]
+
+
+def get_intraday(ticker, tf_minutes=5, bars=120):
+    """N분봉. tf_minutes 에 맞춰 필요한 1분봉을 계산해 수집 후 집계."""
+    need_1m = min(bars * tf_minutes + tf_minutes * 5,
+                  _INTRADAY_PER_CALL * _INTRADAY_MAX_CALLS)
+    raw = get_intraday_1m(ticker, need_bars=need_1m)
+    agg = resample_bars(raw, tf_minutes) if tf_minutes > 1 else raw
+    return agg[-bars:]
+
+
 class KrxLoginRequired(RuntimeError):
     """KRX 로그인이 없어 데이터를 못 받은 경우. 라우터가 사유를 프론트로 전달한다."""
 
