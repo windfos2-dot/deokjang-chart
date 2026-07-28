@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 .chart_cache/
 .DS_Store
+
+# 정적 빌드 산출물 (Actions 에서 생성, 커밋하지 않음)
+docs/data/
+docs/index.json
+docs/meta.json

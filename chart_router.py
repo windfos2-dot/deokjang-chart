@@ -25,6 +25,7 @@ import os
 import traceback
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
+from datetime import date
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -57,6 +58,37 @@ def mtf(ticker: str = Query(..., min_length=6, max_length=6)):
     except Exception as e:  # noqa: BLE001
         frames.append({"tf": "일봉", "available": False, "reason": str(e)})
 
+    # --- 주봉 / 월봉 (일봉 재집계) ---
+    try:
+        o = loader.get_ohlcv(ticker, days=1200)      # 월봉 판정에 충분한 기간
+        def _iso_week(d):
+            y, w, _ = date(int(d[:4]), int(d[5:7]), int(d[8:10])).isocalendar()
+            return f"{y}-W{w:02d}"
+
+        for key_fn, label in ((_iso_week, "주봉"), (lambda d: d[:7], "월봉")):
+            buckets = {}
+            for i, dt in enumerate(o["dates"]):
+                k = key_fn(dt)
+                b = buckets.get(k)
+                if b is None:
+                    buckets[k] = {"h": o["high"][i], "l": o["low"][i], "c": o["close"][i],
+                                  "v": o["volume"][i]}
+                else:
+                    b["h"] = max(b["h"], o["high"][i])
+                    b["l"] = min(b["l"], o["low"][i])
+                    b["c"] = o["close"][i]
+                    b["v"] += o["volume"][i]
+            ks = sorted(buckets)
+            sig = ind.timeframe_signals([buckets[k]["h"] for k in ks],
+                                        [buckets[k]["l"] for k in ks],
+                                        [buckets[k]["c"] for k in ks],
+                                        [buckets[k]["v"] for k in ks])
+            sig["tf"] = label
+            frames.append(sig)
+    except Exception as e:  # noqa: BLE001
+        for label in ("주봉", "월봉"):
+            frames.append({"tf": label, "available": False, "reason": str(e)})
+
     # --- 분봉 (KIS) ---
     if loader.kis_configured():
         for minutes, label in ((5, "5분"), (60, "60분")):
@@ -76,7 +108,7 @@ def mtf(ticker: str = Query(..., min_length=6, max_length=6)):
             frames.append({"tf": label, "available": False,
                            "reason": "KIS 미설정 (분봉은 KIS 전용)"})
 
-    order = {"5분": 0, "60분": 1, "일봉": 2}
+    order = {"5분": 0, "60분": 1, "일봉": 2, "주봉": 3, "월봉": 4}
     frames.sort(key=lambda f: order.get(f.get("tf"), 9))
     return {"ticker": ticker, "frames": frames}
 
