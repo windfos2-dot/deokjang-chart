@@ -43,10 +43,20 @@ _HTML_PATH = os.path.join(_BASE_DIR, "static", "chart_live.html")
 @router.get("/health")
 def health():
     """모듈 상태 + KRX 로그인 게이트 상태."""
+    krx = loader.krx_login_configured()
+    kis = loader.kis_configured()
+    if krx:
+        supply = "KRX(pykrx) — 전 기간"
+    elif kis:
+        supply = f"KIS 폴백 — 최근 {loader.KIS_MAX_DAYS}영업일만"
+    else:
+        supply = "불가 — KRX_ID/KRX_PW 또는 KIS_APP_KEY/SECRET 필요"
     return {
         "ok": True,
-        "krx_login_configured": loader.krx_login_configured(),
-        "note": None if loader.krx_login_configured() else loader._KRX_LOGIN_HINT,
+        "krx_login_configured": krx,
+        "kis_configured": kis,
+        "supply_source": supply,
+        "note": None if krx else loader._KRX_LOGIN_HINT,
     }
 
 
@@ -92,11 +102,19 @@ def full(ticker: str = Query(..., min_length=6, max_length=6),
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=404, detail=f"OHLCV 조회 실패({ticker}): {e}") from e
 
+    # --- 옵션: 벤치마크 지수 (Minervini RS용). 실패해도 차트는 떠야 한다 ---
+    bench = None
+    bench_note = None
+    try:
+        bench = loader.get_benchmark_close(o["dates"], market=o.get("market") or "KOSPI")
+    except Exception as e:  # noqa: BLE001
+        bench_note = f"벤치마크 미적용(RS 조건 제외): {e}"
+
     # --- 필수: 지표 ---
     try:
         indicators = ind.compute_all(
             o["dates"], o["open"], o["high"], o["low"], o["close"], o["volume"],
-            sr_vol_thresh=sr_vol_thresh,
+            sr_vol_thresh=sr_vol_thresh, benchmark_close=bench,
         )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
@@ -113,6 +131,7 @@ def full(ticker: str = Query(..., min_length=6, max_length=6),
         },
         "indicators": indicators,
         "krx_login_configured": loader.krx_login_configured(),
+        "benchmark_note": bench_note,
     }
 
     # --- 옵션: 수급 ---

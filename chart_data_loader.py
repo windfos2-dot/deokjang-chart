@@ -49,6 +49,54 @@ _UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 os.makedirs(_CACHE_DIR, exist_ok=True)
 
 
+def _read_env_file(path):
+    """.env 한 개를 환경변수로 로드 (python-dotenv 의존 없이).
+
+    이미 설정된 키는 덮어쓰지 않는다 → 우선순위: 실제 환경변수 > 앞쪽 파일 > 뒤쪽 파일.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and v and k not in os.environ:
+                    os.environ[k] = v
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[loader] .env 로드 실패(무시) {path}: {e}")
+        return False
+
+
+def _load_dotenv():
+    """.env 를 여러 후보 경로에서 순서대로 로드한다.
+
+    KIS 키처럼 이미 다른 프로젝트에 있는 자격증명을 복사하지 않고 재사용하기 위함.
+    운영(EMS 서버)에서는 실제 환경변수만 있으면 되고, 후보 파일이 없어도 무해하다.
+
+    우선순위:
+      1) 실제 환경변수 (운영 우선)
+      2) 이 모듈 폴더의 .env
+      3) CHART_ENV_FILES 에 지정한 경로들 (콜론 구분)
+      4) 로컬 개발 편의: ../stock-bot/.env  (기존 KIS 키 재사용)
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [os.path.join(here, ".env")]
+    extra = os.getenv("CHART_ENV_FILES", "")
+    candidates += [p for p in extra.split(":") if p]
+    candidates.append(os.path.join(here, os.pardir, "stock-bot", ".env"))
+
+    for path in candidates:
+        _read_env_file(os.path.normpath(path))
+
+
+_load_dotenv()
+
+
 def krx_login_configured():
     """KRX_ID/KRX_PW 환경변수 설정 여부 (수급·공매도·펀더멘털 가용성 판단용)."""
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
@@ -58,6 +106,112 @@ _KRX_LOGIN_HINT = (
     "KRX 로그인 필요: data.krx.co.kr 가 비로그인 요청에 HTTP 400(LOGOUT)을 반환합니다. "
     "서버에 KRX_ID / KRX_PW 환경변수를 설정하세요."
 )
+
+
+# ---------------------------------------------------------------------------
+# KIS(한국투자증권) 폴백 — KRX 로그인이 없을 때 수급을 최근 30일이라도 채운다
+# ---------------------------------------------------------------------------
+# 읽기전용 시세 조회만 사용한다. 주문 관련 API는 절대 호출하지 않는다.
+_KIS_BASE = "https://openapi.koreainvestment.com:9443"
+_KIS_TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".cache", "kis_token.json")
+_kis_token_mem = {"token": None, "expires": 0.0}
+_kis_lock = threading.Lock()
+
+# KIS inquire-investor 는 요청 기간과 무관하게 최근 약 30영업일만 반환한다(실측).
+KIS_MAX_DAYS = 30
+
+
+def kis_configured():
+    return bool(os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET"))
+
+
+def _kis_token():
+    """OAuth 토큰: 메모리 -> 파일 -> 신규발급. 1분 발급한도 때문에 캐시 필수."""
+    now = time.time()
+    with _kis_lock:
+        if _kis_token_mem["token"] and _kis_token_mem["expires"] > now + 60:
+            return _kis_token_mem["token"]
+        try:
+            with open(_KIS_TOKEN_FILE, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("token") and cached.get("expires", 0) > now + 60:
+                _kis_token_mem.update(cached)
+                return cached["token"]
+        except Exception:  # noqa: BLE001
+            pass
+
+        r = requests.post(
+            f"{_KIS_BASE}/oauth2/tokenP",
+            json={"grant_type": "client_credentials",
+                  "appkey": os.getenv("KIS_APP_KEY"),
+                  "appsecret": os.getenv("KIS_APP_SECRET")},
+            timeout=15,
+        )
+        r.raise_for_status()
+        d = r.json()
+        token = d["access_token"]
+        expires = now + int(d.get("expires_in", 86400))
+        _kis_token_mem.update({"token": token, "expires": expires})
+        try:
+            os.makedirs(os.path.dirname(_KIS_TOKEN_FILE), exist_ok=True)
+            with open(_KIS_TOKEN_FILE, "w", encoding="utf-8") as f:
+                json.dump({"token": token, "expires": expires}, f)
+            os.chmod(_KIS_TOKEN_FILE, 0o600)
+        except Exception:  # noqa: BLE001
+            pass
+        return token
+
+
+def get_trading_kis(ticker, days=KIS_MAX_DAYS):
+    """KIS 종목별 투자자매매동향 (최근 ~30영업일, 순매수 '수량').
+
+    ⚠️ pykrx 경로는 거래대금(원) 기준인데 KIS는 수량(주) 기준이라 단위가 다르다.
+       반환 dict 의 unit 필드로 구분한다.
+    """
+    if not kis_configured():
+        raise RuntimeError("KIS_APP_KEY / KIS_APP_SECRET 미설정")
+
+    end = _today_str()
+    start = (datetime.now() - timedelta(days=days * 2 + 10)).strftime("%Y%m%d")
+    r = requests.get(
+        f"{_KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-investor",
+        headers={
+            "authorization": f"Bearer {_kis_token()}",
+            "appkey": os.getenv("KIS_APP_KEY"),
+            "appsecret": os.getenv("KIS_APP_SECRET"),
+            "tr_id": "FHKST01010900",
+        },
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": ticker,
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": end,
+            "FID_PERIOD_DIV_CODE": "D",
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    rows = r.json().get("output") or []
+    if not rows:
+        raise RuntimeError("KIS 수급 응답 없음")
+
+    rows = list(reversed(rows))          # KIS는 최신순 -> 과거순으로 뒤집기
+    dates, foreign, inst, indiv = [], [], [], []
+    for it in rows:
+        d = it.get("stck_bsop_date", "")
+        if len(d) != 8:
+            continue
+        dates.append(f"{d[:4]}-{d[4:6]}-{d[6:]}")
+        foreign.append(float(it.get("frgn_ntby_qty", 0) or 0))
+        inst.append(float(it.get("orgn_ntby_qty", 0) or 0))
+        indiv.append(float(it.get("prsn_ntby_qty", 0) or 0))
+
+    return {
+        "ticker": ticker, "dates": dates,
+        "외국인": foreign, "기관": inst, "개인": indiv, "연기금": None,
+        "source": "KIS", "unit": "주(수량)",
+        "note": f"KRX 로그인 미설정으로 KIS 폴백. 최근 {len(dates)}영업일만 제공.",
+    }
 
 
 class KrxLoginRequired(RuntimeError):
@@ -296,9 +450,26 @@ _INSTITUTION_COLS = ("금융투자", "보험", "투신", "사모", "은행",
 
 
 def get_trading(ticker, days=280, verbose=False):
-    """투자자별 순매수 거래대금.
+    """투자자별 수급. pykrx(KRX 로그인) 우선, 실패 시 KIS 폴백(최근 30일).
 
-    반환: dict(dates, 외국인, 기관, 개인, 연기금)
+    반환: dict(dates, 외국인, 기관, 개인, 연기금, source, unit)
+    """
+    try:
+        return _get_trading_pykrx(ticker, days=days, verbose=verbose)
+    except KrxLoginRequired:
+        if kis_configured():
+            try:
+                out = get_trading_kis(ticker)
+                _ttl_set(("trading", ticker, days), out)
+                return out
+            except Exception as e:  # noqa: BLE001
+                raise KrxLoginRequired(f"수급(KIS 폴백도 실패: {e})") from e
+        raise
+
+
+def _get_trading_pykrx(ticker, days=280, verbose=False):
+    """pykrx 경유 투자자별 순매수 '거래대금'. KRX 로그인 필요.
+
     컬럼명이 pykrx 버전마다 다를 수 있어 유연 매핑한다 (지시서 §7.2).
     """
     key = ("trading", ticker, days)
@@ -357,6 +528,7 @@ def get_trading(ticker, days=280, verbose=False):
         "기관": to_list(inst),
         "개인": to_list(individual),
         "연기금": to_list(pension),
+        "source": "KRX(pykrx)", "unit": "원(거래대금)",
         "_columns": cols,
     }
     _ttl_set(key, out)
@@ -398,6 +570,43 @@ def get_shorting_balance(ticker, days=280):
         "ratio": find_col("비중"),
         "_columns": cols,
     }
+    _ttl_set(key, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 벤치마크 지수 (Minervini RS 계산용) — KRX 로그인 필요
+# ---------------------------------------------------------------------------
+_INDEX_CODE = {"KOSPI": "1001", "KOSDAQ": "2001"}
+
+
+def get_benchmark_close(dates, market="KOSPI"):
+    """종목 날짜열에 정렬된 벤치마크 지수 종가 리스트.
+
+    dates 와 길이가 같은 list 를 반환하며, 지수 데이터가 없는 날짜는 직전 값으로
+    채운다(휴장 등). 조회 실패 시 KrxLoginRequired.
+    """
+    code = _INDEX_CODE.get(market, "1001")
+    key = ("bench", code, dates[0] if dates else "", dates[-1] if dates else "")
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    fromdate = dates[0].replace("-", "") if dates else _fromdate_for(280)
+    todate = dates[-1].replace("-", "") if dates else _today_str()
+    try:
+        df = stock.get_index_ohlcv_by_date(fromdate, todate, code)
+    except Exception as e:  # noqa: BLE001
+        raise KrxLoginRequired("벤치마크지수") from e
+    if df is None or df.empty:
+        raise KrxLoginRequired("벤치마크지수")
+
+    by_date = {d.strftime("%Y-%m-%d"): float(v)
+               for d, v in zip(df.index, df["종가"].astype(float))}
+    out, last = [], None
+    for d in dates:
+        last = by_date.get(d, last)
+        out.append(last)
     _ttl_set(key, out)
     return out
 

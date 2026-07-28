@@ -678,8 +678,12 @@ def order_blocks(open_, high, low, close, volume, swing=5, move_bars=3, min_move
 # ---------------------------------------------------------------------------
 # 통합 계산
 # ---------------------------------------------------------------------------
-def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0):
-    """OHLCV -> 전체 지표 dict (JSON 직렬화 가능)."""
+def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0,
+                benchmark_close=None):
+    """OHLCV -> 전체 지표 dict (JSON 직렬화 가능).
+
+    benchmark_close 를 주면 Minervini 8번 조건(RS 등급)까지 판정한다.
+    """
     open_ = np.asarray(open_, dtype=float)
     high = np.asarray(high, dtype=float)
     low = np.asarray(low, dtype=float)
@@ -726,7 +730,8 @@ def compute_all(dates, open_, high, low, close, volume, sr_vol_thresh=20.0):
     }
 
     # --- Minervini 추세 템플릿 (52주=260봉) ---
-    out["minervini"] = minervini_trend_template(close, lookback=260)
+    out["minervini"] = minervini_trend_template(close, lookback=260,
+                                                benchmark_close=benchmark_close)
 
     # --- S/R 레벨 + 돌파 (LuxAlgo 로직) ---
     sr = support_resistance_breaks(open_, high, low, close, volume,

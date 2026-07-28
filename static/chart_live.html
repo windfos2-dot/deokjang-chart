@@ -122,8 +122,13 @@
   </div>
 
   <div class="panel" id="flow-panel">
-    <div class="ptitle"><span>수급 — 외국인 순매수(거래대금)</span><span id="flow-note" class="mk"></span></div>
+    <div class="ptitle"><span>수급 — 외국인 순매수</span><span id="flow-note" class="mk"></span></div>
     <div id="flow-chart" style="height:150px"></div>
+  </div>
+
+  <div class="panel" id="short-panel">
+    <div class="ptitle"><span>공매도 잔고 (수량 / 비중%)</span><span id="short-note" class="mk"></span></div>
+    <div id="short-chart" style="height:140px"></div>
   </div>
 </main>
 
@@ -149,7 +154,8 @@ const volChart  = LightweightCharts.createChart($("#vol-chart"),  {...COMMON, he
 const rsiChart  = LightweightCharts.createChart($("#rsi-chart"),  {...COMMON, height:140});
 const sqzChart  = LightweightCharts.createChart($("#sqz-chart"),  {...COMMON, height:140});
 const flowChart = LightweightCharts.createChart($("#flow-chart"), {...COMMON, height:150});
-const CHARTS = [mainChart, volChart, rsiChart, sqzChart, flowChart];
+const shortChart = LightweightCharts.createChart($("#short-chart"), {...COMMON, height:140});
+const CHARTS = [mainChart, volChart, rsiChart, sqzChart, flowChart, shortChart];
 
 // 시리즈
 const candle = mainChart.addCandlestickSeries({
@@ -186,6 +192,13 @@ const volSeries  = volChart.addHistogramSeries({priceFormat:{type:"volume"}});
 const rsiSeries  = rsiChart.addLineSeries({color:"#e6edf3", lineWidth:1, priceLineVisible:false});
 const sqzSeries  = sqzChart.addHistogramSeries({priceLineVisible:false});
 const flowSeries = flowChart.addHistogramSeries({priceLineVisible:false});
+const shortQty = shortChart.addAreaSeries({
+  topColor:"rgba(226,68,92,.35)", bottomColor:"rgba(226,68,92,.02)",
+  lineColor:"#e2445c", lineWidth:1, priceLineVisible:false});
+const shortRatio = shortChart.addLineSeries({
+  color:"#f0b90b", lineWidth:1, priceScaleId:"right2",
+  priceLineVisible:false, lastValueVisible:true});
+shortChart.priceScale("right2").applyOptions({scaleMargins:{top:.1,bottom:.1}});
 
 rsiSeries.createPriceLine({price:70, color:"#e2445c", lineWidth:1, lineStyle:2, axisLabelVisible:false});
 rsiSeries.createPriceLine({price:30, color:"#3b82f6", lineWidth:1, lineStyle:2, axisLabelVisible:false});
@@ -210,6 +223,7 @@ window.addEventListener("resize", () => {
   rsiChart.applyOptions({width: $("#rsi-chart").clientWidth});
   sqzChart.applyOptions({width: $("#sqz-chart").clientWidth});
   flowChart.applyOptions({width: $("#flow-chart").clientWidth});
+  shortChart.applyOptions({width: $("#short-chart").clientWidth});
 });
 
 // 동적 시리즈 (패턴 추세선 / 오더블록 박스)
@@ -363,7 +377,9 @@ function render(d){
   const tr = d.trading || {available:false};
   if (tr.available && tr["외국인"]){
     $("#flow-panel").classList.remove("off");
-    $("#flow-note").textContent = "";
+    $("#flow-note").textContent =
+      `출처 ${tr.source||"?"} · 단위 ${tr.unit||"?"} · ${tr.dates?.length||0}일` +
+      (tr.note ? ` · ${tr.note}` : "");
     flowSeries.setData(tr.dates.map((t,i)=>({
       time:t, value:tr["외국인"][i],
       color: tr["외국인"][i] >= 0 ? "rgba(226,68,92,.75)" : "rgba(59,130,246,.75)"
@@ -372,6 +388,19 @@ function render(d){
     $("#flow-panel").classList.add("off");
     flowSeries.setData([]);
     $("#flow-note").textContent = "비활성 — " + (tr.reason || "데이터 없음");
+  }
+
+  // 공매도 잔고
+  const sh = d.shorting || {available:false};
+  if (sh.available && sh.balance_qty){
+    $("#short-panel").classList.remove("off");
+    $("#short-note").textContent = `${sh.dates.length}일`;
+    shortQty.setData(pairs(sh.dates, sh.balance_qty));
+    shortRatio.setData(pairs(sh.dates, sh.ratio));
+  } else {
+    $("#short-panel").classList.add("off");
+    shortQty.setData([]); shortRatio.setData([]);
+    $("#short-note").textContent = "비활성 — " + (sh.reason || "데이터 없음");
   }
 
   // 헤더 메타
