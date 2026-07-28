@@ -1,7 +1,23 @@
-# EMS 차트 모듈 (실데이터)
+# 덕장 차트 (deokjang-chart)
 
-에이트파트너스 EMS에 붙이는 **종목 검색 + 실데이터 차트** 모듈.
-국장 데이터(수급·신용)와 판단 자동화가 목표. pykrx/KRX/KIND 실데이터 기반.
+**종목 검색 + 실데이터 차트** 모듈. 국장 데이터(수급·공매도)와 판단 자동화가 목표.
+pykrx / KRX / KIS 실데이터 기반.
+
+## 실행
+
+```bash
+./start.sh          # 기본 8010 포트, 브라우저 자동 열림
+./start.sh 9000     # 포트 지정
+```
+
+처음 받은 경우엔 venv부터:
+
+```bash
+python3.12 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+```
+
+자격증명은 `.env` 에 넣는다 (`.env.example` 참고). KRX 로그인이 없으면
+수급은 KIS 폴백(최근 30영업일)으로 자동 전환된다.
 
 ## 구성
 
