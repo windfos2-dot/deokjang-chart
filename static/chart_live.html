@@ -356,13 +356,10 @@ CHARTS.forEach((c) => {
   });
 });
 
-// 밴드에서 스크롤/줌 하면 가격 차트들도 같은 기간으로 맞춘다 (양방향)
-bandChart.timeScale().subscribeVisibleTimeRangeChange((t) => {
-  if (syncing || !t) return;
-  syncing = true;
-  CHARTS.forEach((o) => { try { o.timeScale().setVisibleRange(t); } catch(e){} });
-  syncing = false;
-});
+// ⚠️ 양방향으로 묶지 않는다.
+// 밴드는 최대 15년, 가격 차트는 선택 기간(예: 3년)이라 데이터 길이가 다르다.
+// 밴드 -> 가격 방향까지 걸면 서로의 구간을 덮어쓰며 차트가 튀었다.
+// 가격 차트가 기준(master), 밴드가 따라가는 단방향만 유지한다.
 
 window.addEventListener("resize", () => {
   CHARTS.forEach((c) => c.applyOptions({ width: c._el ? c._el.clientWidth : undefined }));
