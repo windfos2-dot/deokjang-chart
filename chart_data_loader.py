@@ -101,6 +101,44 @@ def _load_dotenv():
 _load_dotenv()
 
 
+_krx_login_disabled = False
+
+
+def disable_krx_login(reason=""):
+    """KRX 웹로그인 경로를 이 프로세스에서 끈다.
+
+    계정이 잠기면(CD007) pykrx 는 매 호출마다 재로그인을 시도하다 예외를 던진다.
+    반복 시도는 잠금을 연장시키므로, 한 번 실패하면 환경변수를 비워
+    pykrx 가 스스로 '미설정' 경로(예외 없이 None 반환)를 타게 한다.
+    오픈API(KRX_API_KEY)·KIS 는 별개 인증이라 영향받지 않는다.
+    """
+    global _krx_login_disabled
+    if _krx_login_disabled:
+        return
+    _krx_login_disabled = True
+    os.environ.pop("KRX_ID", None)
+    os.environ.pop("KRX_PW", None)
+    print(f"[loader] KRX 웹로그인 비활성화 (재시도 중단): {reason}")
+
+
+def krx_login_broken():
+    return _krx_login_disabled
+
+
+def _pykrx(fn, *a, **kw):
+    """pykrx 호출 래퍼. 로그인 관련 실패면 차단기를 올리고 None 을 준다."""
+    if _krx_login_disabled:
+        return None
+    try:
+        return fn(*a, **kw)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "Expecting value" in msg or "JSONDecode" in msg or "로그인" in msg:
+            disable_krx_login(f"{type(e).__name__}: {msg[:60]}")
+            return None
+        raise
+
+
 def krx_login_configured():
     """KRX_ID/KRX_PW 환경변수 설정 여부 (수급·공매도·펀더멘털 가용성 판단용)."""
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
@@ -291,7 +329,7 @@ def get_forward_estimates(ticker):
     mktcap_eok = None
     cap_src = None
     try:
-        df = stock.get_market_cap_by_ticker(_today_str(), market="ALL")
+        df = _pykrx(stock.get_market_cap_by_ticker, _today_str(), market="ALL")
         if ticker in df.index:
             mktcap_eok = float(df.loc[ticker, "시가총액"]) / 1e8
             cap_src = "KRX"
@@ -911,7 +949,19 @@ def get_ohlcv(ticker, days=280):
 
     fromdate = _fromdate_for(days)
     todate = _today_str()
-    df = stock.get_market_ohlcv_by_date(fromdate, todate, ticker, adjusted=True)
+    # ⚠️ OHLCV(adjusted=True)는 네이버 소스라 KRX 로그인이 필요 없다.
+    #    다만 pykrx 는 KRX_ID/PW 가 있으면 호출 전에 로그인을 먼저 시도하고,
+    #    계정이 잠겨 있으면 거기서 예외를 던져 멀쩡한 시세까지 못 받는다.
+    #    -> 첫 실패에 차단기를 올린 뒤(환경변수 제거) 바로 재시도한다.
+    try:
+        df = stock.get_market_ohlcv_by_date(fromdate, todate, ticker, adjusted=True)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "Expecting value" in msg or "JSONDecode" in msg:
+            disable_krx_login(f"OHLCV 중 로그인 실패: {msg[:40]}")
+            df = stock.get_market_ohlcv_by_date(fromdate, todate, ticker, adjusted=True)
+        else:
+            raise
     if df is None or df.empty:
         raise ValueError(f"OHLCV 데이터 없음: {ticker}")
 
@@ -977,7 +1027,7 @@ def _get_trading_pykrx(ticker, days=280, verbose=False):
     fromdate = _fromdate_for(days)
     todate = _today_str()
     try:
-        df = stock.get_market_trading_value_by_date(
+        df = _pykrx(stock.get_market_trading_value_by_date,
             fromdate, todate, ticker, on="순매수", detail=True
         )
     except Exception as e:  # noqa: BLE001  (pykrx 내부에서 비-JSON 응답 시)
@@ -1045,7 +1095,7 @@ def get_shorting_balance(ticker, days=280):
     fromdate = _fromdate_for(days)
     todate = _today_str()
     try:
-        df = stock.get_shorting_balance_by_date(fromdate, todate, ticker)
+        df = _pykrx(stock.get_shorting_balance_by_date, fromdate, todate, ticker)
     except Exception as e:  # noqa: BLE001
         raise KrxLoginRequired("공매도잔고") from e
     if df is None or df.empty:
@@ -1077,6 +1127,114 @@ def get_shorting_balance(ticker, days=280):
 _INDEX_CODE = {"KOSPI": "1001", "KOSDAQ": "2001"}
 
 
+_IDX_OPENAPI = {
+    "KOSPI": ("idx/kospi_dd_trd", "코스피"),
+    "KOSPI200": ("idx/kospi_dd_trd", "코스피 200"),
+    "KOSDAQ": ("idx/kosdaq_dd_trd", "코스닥"),
+    "KOSDAQ150": ("idx/kosdaq_dd_trd", "코스닥 150"),
+}
+
+
+_idx_bulk_cache = {"data": None, "built": 0.0, "days": 0}
+_idx_lock = threading.Lock()
+
+
+def _fetch_indices_bulk(days=280, workers=4):
+    """날짜별로 지수 응답을 '한 번만' 받아 모든 지수를 함께 담는다.
+
+    지수 하나당 434일씩 따로 돌면 같은 응답을 4번 받는 셈이라 레이트리밋에 걸린다.
+    (실측: 4종 개별 호출 시 KOSPI 실패, KOSDAQ 1일만 수신)
+    한 응답에 40~51개 지수가 들어있으므로 한 번 받아 나눠 쓴다.
+
+    반환: {(ep, IDX_NM): {날짜: row}}
+    """
+    with _idx_lock:
+        now = time.time()
+        c = _idx_bulk_cache
+        if c["data"] and now - c["built"] < _MKTCAP_TTL and c["days"] >= days:
+            return c["data"]
+
+        key = _krx_openapi_key()
+        if not key:
+            raise RuntimeError("KRX_API_KEY 미설정")
+
+        cand, d = [], datetime.now()
+        while len(cand) < int(days * 1.55):
+            if d.weekday() < 5:
+                cand.append(d.strftime("%Y%m%d"))
+            d -= timedelta(days=1)
+
+        eps = sorted({ep for ep, _ in _IDX_OPENAPI.values()})
+
+        def fetch(ds):
+            got = {}
+            for ep in eps:
+                for attempt in range(3):
+                    try:
+                        r = requests.get(f"{_KRX_OPENAPI}/{ep}", params={"basDd": ds},
+                                         headers={"AUTH_KEY": key}, timeout=25)
+                        rows = next((v for v in r.json().values()
+                                     if isinstance(v, list)), [])
+                        for x in rows:
+                            got[(ep, (x.get("IDX_NM") or "").strip())] = x
+                        break
+                    except Exception:  # noqa: BLE001
+                        time.sleep(0.5 * (attempt + 1))     # 레이트리밋 백오프
+            return ds, got
+
+        out = defaultdict(dict)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for ds, got in ex.map(fetch, cand):
+                for k, row in got.items():
+                    out[k][ds] = row
+        data = dict(out)
+        _idx_bulk_cache.update({"data": data, "built": now, "days": days})
+        return data
+
+
+def get_index_ohlcv_openapi(name="KOSPI", days=280, workers=6):
+    """KRX 오픈API 로 지수 시계열을 만든다.
+
+    pykrx 의 get_index_ohlcv_by_date 는 KRX 웹로그인이 필요해 계정이 잠기면
+    막힌다. 오픈API 는 별개 인증(AUTH_KEY)이라 영향을 받지 않는다.
+    '날짜 1개 = 전 지수' 구조라 날짜만 병렬로 돌면 된다.
+    """
+    key = _krx_openapi_key()
+    if not key:
+        raise RuntimeError("KRX_API_KEY 미설정")
+    ep, idx_nm = _IDX_OPENAPI.get(name, _IDX_OPENAPI["KOSPI"])
+
+    cache_key = ("idxopen", name, days)
+    cached = _ttl_get(cache_key)
+    if cached is not None:
+        return cached
+
+    got = _fetch_indices_bulk(days).get((ep, idx_nm), {})
+
+    def _num(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+
+    out = {"dates": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+    for ds in sorted(got)[-days:]:
+        x = got[ds]
+        c = _num(x.get("CLSPRC_IDX"))
+        if not c:
+            continue
+        out["dates"].append(f"{ds[:4]}-{ds[4:6]}-{ds[6:]}")
+        out["open"].append(_num(x.get("OPNPRC_IDX")) or c)
+        out["high"].append(_num(x.get("HGPRC_IDX")) or c)
+        out["low"].append(_num(x.get("LWPRC_IDX")) or c)
+        out["close"].append(c)
+        out["volume"].append(_num(x.get("ACC_TRDVOL")) or 0.0)
+    out["name"] = idx_nm
+    out["source"] = "KRX오픈API"
+    _ttl_set(cache_key, out)
+    return out
+
+
 def get_benchmark_close(dates, market="KOSPI"):
     """종목 날짜열에 정렬된 벤치마크 지수 종가 리스트.
 
@@ -1091,15 +1249,31 @@ def get_benchmark_close(dates, market="KOSPI"):
 
     fromdate = dates[0].replace("-", "") if dates else _fromdate_for(280)
     todate = dates[-1].replace("-", "") if dates else _today_str()
+    by_date = None
     try:
-        df = stock.get_index_ohlcv_by_date(fromdate, todate, code)
-    except Exception as e:  # noqa: BLE001
-        raise KrxLoginRequired("벤치마크지수") from e
-    if df is None or df.empty:
-        raise KrxLoginRequired("벤치마크지수")
+        df = _pykrx(stock.get_index_ohlcv_by_date, fromdate, todate, code)
+        if df is not None and not df.empty:
+            by_date = {d.strftime("%Y-%m-%d"): float(v)
+                       for d, v in zip(df.index, df["종가"].astype(float))}
+    except Exception:  # noqa: BLE001
+        by_date = None
 
-    by_date = {d.strftime("%Y-%m-%d"): float(v)
-               for d, v in zip(df.index, df["종가"].astype(float))}
+    if not by_date:
+        # pykrx 는 KRX 웹로그인이 필요하다. 계정이 잠겨도 오픈API 로는 받을 수 있다.
+        # ⚠️ 다만 오픈API 지수는 '날짜당 1콜' 이라 수백 콜이 나간다.
+        #    /full 같은 일반 조회에서 이걸 매번 트리거하면 KRX 에 과부하를 주고
+        #    (실측: IP 차단까지 갔다) 응답도 몇 분씩 걸린다.
+        #    -> 이미 받아둔 캐시가 있을 때만 쓰고, 없으면 즉시 포기한다.
+        if _idx_bulk_cache.get("data"):
+            try:
+                idx = get_index_ohlcv_openapi(market, days=max(len(dates), 280))
+                by_date = dict(zip(idx["dates"], idx["close"]))
+            except Exception:  # noqa: BLE001
+                by_date = None
+        if not by_date:
+            raise KrxLoginRequired("벤치마크지수(캐시 없음 — RS 조건 제외)")
+    if not by_date:
+        raise KrxLoginRequired("벤치마크지수")
     out, last = [], None
     for d in dates:
         last = by_date.get(d, last)
@@ -1120,7 +1294,7 @@ def get_fundamental(ticker, days=280):
     fromdate = _fromdate_for(days)
     todate = _today_str()
     try:
-        df = stock.get_market_fundamental_by_date(fromdate, todate, ticker)
+        df = _pykrx(stock.get_market_fundamental_by_date, fromdate, todate, ticker)
     except Exception as e:  # noqa: BLE001
         raise KrxLoginRequired("펀더멘털") from e
     if df is None or df.empty:

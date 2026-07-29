@@ -66,11 +66,11 @@
   .vd.bear{background:#3f1620;color:#f87171}
   .vd.flat{background:#26303f;color:#9aa7b8}
   .btngroup{display:inline-flex;border:1px solid var(--border);border-radius:5px;overflow:hidden}
-  .bm,.bb,.by{background:#0e131c;color:var(--muted);border:0;padding:3px 8px;
+  .tfb,.pdb,.bm,.bb,.by{background:#0e131c;color:var(--muted);border:0;padding:3px 8px;
               font-size:11px;cursor:pointer;font-family:inherit}
-  .bm+.bm,.bb+.bb,.by+.by{border-left:1px solid var(--border)}
-  .bm.on,.bb.on,.by.on{background:var(--accent);color:#06231f;font-weight:600}
-  .bm:hover:not(.on),.bb:hover:not(.on),.by:hover:not(.on){background:#1b2432;color:var(--text)}
+  .tfb+.tfb,.pdb+.pdb,.bm+.bm,.bb+.bb,.by+.by{border-left:1px solid var(--border)}
+  .tfb.on,.pdb.on,.bm.on,.bb.on,.by.on{background:var(--accent);color:#06231f;font-weight:600}
+  .tfb:hover:not(.on),.pdb:hover:not(.on),.bm:hover:not(.on),.bb:hover:not(.on),.by:hover:not(.on){background:#1b2432;color:var(--text)}
   #sig-table{width:100%;border-collapse:collapse;font-size:11px}
   #sig-table td,#sig-table th{padding:4px 5px;border-bottom:1px solid #1b2432;white-space:nowrap}
   #sig-table th{color:var(--muted);font-weight:500;text-align:right}
@@ -124,6 +124,8 @@
 <div id="banner"></div>
 
 <div id="toggles">
+  <span class="btngroup"><button class="tfb on" data-tf="D">일봉</button><button class="tfb" data-tf="W">주봉</button><button class="tfb" data-tf="M">월봉</button></span>
+  <span class="btngroup"><button class="pdb" data-d="250">1년</button><button class="pdb on" data-d="750">3년</button><button class="pdb" data-d="1250">5년</button><button class="pdb" data-d="2600">10년</button><button class="pdb" data-d="5200">20년</button></span>
   <label><input type="checkbox" id="t-ma" checked>이동평균(5·10·20·50·120)</label>
   <label><input type="checkbox" id="t-bb" checked>볼린저(20,2)</label>
   <label><input type="checkbox" id="t-hma" checked>HMA(60)</label>
@@ -316,436 +318,19 @@ window.addEventListener("resize", () => {
 // 동적 시리즈 (패턴 추세선 / 오더블록 박스)
 let patternSeries = [], obSeries = [];
 let CUR_TICKER = null;
-function clearDynamic(list){
-  list.forEach((s) => { try { mainChart.removeSeries(s); } catch(e){} });
-  list.length = 0;
-}
+let PERIOD = 750;      // 서버에서 받아올 일봉 수 (3년)
+let TF = "D";          // D=일봉 W=주봉 M=월봉
+let RAW = null;        // 서버 원본 (재집계 전)
 
-// 마지막 응답 보관 (토글 재적용용)
-let LAST = null;
-
-function applyToggles(){
-  if (!LAST) return;
-  const on = (id) => $(id).checked;
-  MA_SERIES.forEach(s => s.applyOptions({visible: on("#t-ma")}));
-  BB_SERIES.forEach(s => s.applyOptions({visible: on("#t-bb")}));
-  hma60.applyOptions({visible: on("#t-hma")});
-  ICH_SERIES.forEach(s => s.applyOptions({visible: on("#t-ich")}));
-  SR_SERIES.forEach(s => s.applyOptions({visible: on("#t-sr")}));
-  patternSeries.forEach(s => s.applyOptions({visible: on("#t-pat")}));
-  obSeries.forEach(s => s.applyOptions({visible: on("#t-ob")}));
-  drawMarkers();
-}
-
-// 캔들 마커 = RSI 다이버전스 + S/R 돌파 (토글에 따라 합성)
-function drawMarkers(){
-  if (!LAST) return;
-  const dates = LAST.ohlcv.dates, ind = LAST.indicators;
-  let marks = [];
-  if ($("#t-div").checked) {
-    marks = marks.concat((ind.rsi_bear_div||[]).map(i=>({
-      time:dates[i], position:"aboveBar", color:"#e2445c", shape:"arrowDown", text:"Bear"
-    })));
-  }
-  if ($("#t-sr").checked && ind.sr) {
-    marks = marks.concat((ind.sr.breaks||[]).map(b=>{
-      const up = (b.type==="break_up" || b.type==="bull_wick");
-      return {
-        time:dates[b.index],
-        position: up ? "belowBar" : "aboveBar",
-        color: up ? "#22c55e" : "#e2445c",
-        shape: up ? "arrowUp" : "arrowDown",
-        text: b.label || "B"
-      };
-    }));
-  }
-  marks.sort((a,b)=> a.time < b.time ? -1 : 1);
-  candle.setMarkers(marks);
-}
-
-["#t-ma","#t-bb","#t-hma","#t-ich","#t-pat","#t-sr","#t-ob","#t-div"]
-  .forEach(id => document.querySelector(id).addEventListener("change", applyToggles));
-
-// ---- 데이터 바인딩 ----
-function pairs(dates, arr){
-  const out = [];
-  if (!arr) return out;
-  for (let i=0;i<dates.length;i++){
-    if (arr[i] !== null && arr[i] !== undefined) out.push({ time: dates[i], value: arr[i] });
-  }
-  return out;
-}
-
-function render(d){
-  LAST = d;
-  const o = d.ohlcv, ind = d.indicators, dates = o.dates;
-
-  candle.setData(dates.map((t,i)=>({
-    time:t, open:o.open[i], high:o.high[i], low:o.low[i], close:o.close[i]
-  })));
-  ma5.setData(pairs(dates, ind.sma5));
-  ma10.setData(pairs(dates, ind.sma10));
-  ma20.setData(pairs(dates, ind.sma20));
-  ma50.setData(pairs(dates, ind.sma50));
-  ma120.setData(pairs(dates, ind.sma120));
-  hma60.setData(pairs(dates, ind.hma60));
-  bbU.setData(pairs(dates, ind.bb_upper));
-  bbL.setData(pairs(dates, ind.bb_lower));
-
-  // 이치모쿠
-  const ich = ind.ichimoku || {};
-  ichTen.setData(pairs(dates, ich.tenkan));
-  ichKij.setData(pairs(dates, ich.kijun));
-  ichA.setData(pairs(dates, ich.span_a));
-  ichB.setData(pairs(dates, ich.span_b));
-  ichChi.setData(pairs(dates, ich.chikou));
-
-  // S/R 계단선 (LuxAlgo 원본)
-  const sr = ind.sr || {};
-  srHi.setData(pairs(dates, sr.resistance));
-  srLo.setData(pairs(dates, sr.support));
-
-  // 오더블록 (Flux 원본: 강세/약세 각 3개, 무효화된 존은 흐리게)
-  clearDynamic(obSeries);
-  const ob = ind.order_blocks || {bull:[], bear:[]};
-  [...(ob.bull||[]), ...(ob.bear||[])].forEach((b)=>{
-    const endIdx = Math.min(dates.length-1, b.index + 20);
-    const alpha = b.broken ? .22 : .6;
-    const color = b.type==="bull" ? `rgba(34,197,94,${alpha})` : `rgba(226,68,92,${alpha})`;
-    [b.top, b.bottom].forEach((y)=>{
-      const s = mkLine({color, lineWidth:1, lineStyle:b.broken?2:0});
-      s.setData([{time:dates[b.index], value:y},{time:dates[endIdx], value:y}]);
-      obSeries.push(s);
-    });
-  });
-
-  // Minervini 추세 템플릿 배지
-  const mv = ind.minervini && ind.minervini.latest;
-  if (mv){
-    const L = {
-      c1_above_ma150_ma200:"종가>150·200MA", c2_ma150_above_ma200:"150MA>200MA",
-      c3_ma200_rising_1m:"200MA 1개월 상승", c4_ma50_above_ma150_ma200:"50MA>150·200MA",
-      c5_close_above_ma50:"종가>50MA", c6_above_52w_low_30pct:"52주저가+30%↑",
-      c7_within_25pct_of_52w_high:"52주고가-25%내", c8_rs_rating_70:"RS≥70",
-    };
-    $("#mnv").innerHTML =
-      `<span class="badge ${mv.pass?'ok':'no'}">Minervini 추세템플릿 ${mv.pass?'통과':'미충족'}</span> ` +
-      Object.keys(L).map(k=>{
-        const v = mv[k];
-        const cls = v===true?"y":(v===false?"n":"na");
-        return `<span class="crit ${cls}">${v===true?"✓":(v===false?"✗":"–")} ${L[k]}</span>`;
-      }).join("") +
-      ` <span class="mk">52주저가 ${mv.pct_above_52w_low?.toFixed(0)}% / 고가 ${mv.pct_below_52w_high?.toFixed(0)}%</span>`;
-  } else { $("#mnv").innerHTML = ""; }
-
-  volSeries.setData(dates.map((t,i)=>({
-    time:t, value:o.volume[i],
-    color: o.close[i] >= o.open[i] ? "rgba(226,68,92,.55)" : "rgba(59,130,246,.55)"
-  })));
-
-  rsiSeries.setData(pairs(dates, ind.rsi));
-
-  const sq = ind.squeeze || {val:[],color:[]};
-  sqzSeries.setData(dates.map((t,i)=>(
-    sq.val[i]===null||sq.val[i]===undefined ? {time:t} :
-    {time:t, value:sq.val[i], color:sq.color[i] || "#5d6d7e"}
-  )).filter(x=>x.value!==undefined));
-
-  // 패턴 추세선 (MA20 노란색과 겹치지 않게 별도 색상)
-  clearDynamic(patternSeries);
-  (ind.patterns||[]).forEach((p)=>{
-    [["upper","#ff7ac6"],["lower","#7dd3fc"]].forEach(([k,color])=>{
-      const ln = p[k];
-      const s = mkLine({color, lineWidth:1, lineStyle:2});
-      s.setData([{time:dates[ln.x1], value:ln.y1},{time:dates[ln.x2], value:ln.y2}]);
-      patternSeries.push(s);
-    });
-  });
-  $("#patterns").innerHTML = (ind.patterns||[]).length
-    ? (ind.patterns||[]).map(p=>`<span class="tag">${p.name} <span class="mk">${dates[p.start]}~${dates[p.end]}</span></span>`).join("")
-    : `<span class="mk">감지된 패턴 없음</span>`;
-
-  // 수급
-  const tr = d.trading || {available:false};
-  if (tr.available && tr["외국인"]){
-    $("#flow-panel").classList.remove("off");
-    $("#flow-note").textContent =
-      `출처 ${tr.source||"?"} · 단위 ${tr.unit||"?"} · ${tr.dates?.length||0}일` +
-      (tr.note ? ` · ${tr.note}` : "");
-    flowSeries.setData(tr.dates.map((t,i)=>({
-      time:t, value:tr["외국인"][i],
-      color: tr["외국인"][i] >= 0 ? "rgba(226,68,92,.75)" : "rgba(59,130,246,.75)"
-    })));
-  } else {
-    $("#flow-panel").classList.add("off");
-    flowSeries.setData([]);
-    $("#flow-note").textContent = "비활성 — " + (tr.reason || "데이터 없음");
-  }
-
-  // 공매도 잔고
-  const sh = d.shorting || {available:false};
-  if (sh.available && sh.balance_qty){
-    $("#short-panel").classList.remove("off");
-    $("#short-note").textContent = `${sh.dates.length}일`;
-    shortQty.setData(pairs(sh.dates, sh.balance_qty));
-    shortRatio.setData(pairs(sh.dates, sh.ratio));
-  } else {
-    $("#short-panel").classList.add("off");
-    shortQty.setData([]); shortRatio.setData([]);
-    $("#short-note").textContent = "비활성 — " + (sh.reason || "데이터 없음");
-  }
-
-  // 헤더 메타
-  const last = o.close[o.close.length-1], prev = o.close[o.close.length-2] ?? last;
-  const chg = prev ? ((last-prev)/prev*100) : 0;
-  $("#meta").innerHTML =
-    `<b>${d.name ?? ""}</b> <span class="mk">${d.ticker ?? ""} · ${d.market ?? ""}</span>` +
-    `<span>${Number(last).toLocaleString()}원</span>` +
-    `<span class="chg ${chg>=0?"up":"down"}">${chg>=0?"+":""}${chg.toFixed(2)}%</span>` +
-    `<span class="mk">${o.dates[0]} ~ ${o.dates[o.dates.length-1]} (${o.dates.length}봉)</span>`;
-
-  // AlgoAlpha 스퀴즈 패널
-  const aa = ind.squeeze_aa || {};
-  if (aa.vf){
-    aaVf.setData(dates.map((t,i)=>(
-      aa.vf[i]==null ? null : {time:t, value:aa.vf[i], color: aa.vf[i]>0 ? "#00ffbb" : "#ff1100"}
-    )).filter(Boolean));
-    aaZ.setData(pairs(dates, aa.zscore));
-    // 스퀴즈 상태: hyper=노랑, 압축완화=주황, 그외 회색 (원본 색상 규칙)
-    aaSq.setData(dates.map((t,i)=>{
-      if (aa.squeeze_val[i]==null) return null;
-      const relax = (aa.squeeze_ma[i]!=null) && (aa.squeeze_ma[i]-aa.squeeze_val[i] < 0);
-      return {time:t, value:2,
-              color: aa.hyper[i] ? "#facc15" : (relax ? "#fb923c" : "#5d6d7e")};
-    }).filter(Boolean));
-    const hy = aa.hyper.filter(Boolean).length;
-    $("#aa-note").textContent = `하이퍼스퀴즈 ${hy}회 · z=${aa.zscore.at(-1)==null?"-":aa.zscore.at(-1).toFixed(0)}`;
-  }
-
-  renderEstimates(d.estimates, o.close[o.close.length-1]);
-  CUR_TICKER = d.ticker;
-  loadMTF(d.ticker);       // 분봉은 별도 호출 (일봉 렌더를 막지 않도록 비동기)
-  loadSignals(d.ticker);
-  loadBands(d.ticker);
-  applyToggles();          // 마커 + 시리즈 표시상태 일괄 적용
-  mainChart.timeScale().fitContent();
-}
-
-// ---- 밸류에이션 밴드 ----
-let BAND_M = "PER", BAND_B = "FY", BAND_Y = 5, BAND_CACHE = {};
-const bandLine = bandChart.addLineSeries({color:"#38bdf8", lineWidth:2, priceLineVisible:false});
-const bandRefs = ["#f0b90b","#8b97a8","#8b97a8","#5d6d7e","#5d6d7e"].map((c,i)=>
-  bandChart.addLineSeries({color:c, lineWidth:1, lineStyle:i===0?0:(i<3?2:3),
-    priceLineVisible:false, lastValueVisible:i===0}));
-const bandFwd = bandChart.addLineSeries({color:"#4ade80", lineWidth:2, lineStyle:1,
-  priceLineVisible:false, lastValueVisible:true});
-
-async function loadBands(ticker){
-  const note = $("#band-note");
-  const ck = ticker + "|" + BAND_B;
-  if(!BAND_CACHE[ck]){
-    note.textContent = "불러오는 중… (최초 1회는 시총 수집으로 40초 정도)";
-    try{
-      const r = await fetch(`${API_BASE}/api/chart/bands?ticker=${ticker}&basis=${BAND_B}`);
-      BAND_CACHE[ck] = r.ok ? await r.json() : {available:false, reason:"HTTP "+r.status};
-    }catch(e){ BAND_CACHE[ck] = {available:false, reason:e.message}; }
-  }
-  renderBand();
-}
-
-function renderBand(){
-  const note = $("#band-note");
-  const d = BAND_CACHE[(CUR_TICKER||"") + "|" + BAND_B];
-  const clear = () => { bandLine.setData([]); bandFwd.setData([]); bandRefs.forEach(s=>s.setData([])); };
-  if(!d || !d.available){ clear(); note.textContent = d ? (d.reason||"데이터 없음") : ""; return; }
-
-  let pts = (d.series[BAND_M]||[]).map(x=>({time:x[0], value:x[1]}));
-  if(!pts.length){ clear(); note.textContent = `${BAND_M} 산출 불가 (적자 등)`; return; }
-  // 일별이므로 1년 ≈ 252봉
-  pts = pts.slice(-BAND_Y*252);
-  bandLine.setData(pts);
-
-  const vals = pts.map(p=>p.value);
-  const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
-  const sd = Math.sqrt(vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length);
-  const t0 = pts[0].time, t1 = pts[pts.length-1].time;
-  [mean, mean+sd, mean-sd, mean+2*sd, mean-2*sd].forEach((lv,i)=>
-    bandRefs[i].setData([{time:t0,value:lv},{time:t1,value:lv}]));
-
-  // 포워드 배수를 수평선으로 얹어 현재 밸류가 역사 어디쯤인지 보이게 한다
-  let fwdTxt = "";
-  const fw = d.forward;
-  if(fw && (BAND_M==="PER"||BAND_M==="POR"||BAND_M==="PBR")){
-    const r0 = fw.rows.find(r=>r[BAND_M]!=null);
-    if(r0){
-      bandFwd.setData([{time:t0,value:r0[BAND_M]},{time:t1,value:r0[BAND_M]}]);
-      const fz = sd ? (r0[BAND_M]-mean)/sd : 0;
-      fwdTxt = ` · <span style="color:#4ade80">FWD ${r0.period} ${r0[BAND_M].toFixed(2)} (${fz>=0?'+':''}${fz.toFixed(1)}σ)</span>`;
-    } else bandFwd.setData([]);
-  } else bandFwd.setData([]);
-
-  const cur = vals[vals.length-1];
-  const z = sd ? (cur-mean)/sd : 0;
-  const pct = vals.filter(v=>v<=cur).length/vals.length*100;
-  note.innerHTML = `${d.basis} · 현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · 평균 ${mean.toFixed(2)} · ` +
-    `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt;
-  requestAnimationFrame(()=>bandChart.timeScale().fitContent());
-}
-
-document.querySelectorAll(".bm").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".bm").forEach(x=>x.classList.toggle("on",x===b));
-  BAND_M=b.dataset.m; renderBand(); }));
-document.querySelectorAll(".by").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".by").forEach(x=>x.classList.toggle("on",x===b));
-  BAND_Y=+b.dataset.y; renderBand(); }));
-document.querySelectorAll(".bb").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".bb").forEach(x=>x.classList.toggle("on",x===b));
-  BAND_B=b.dataset.b; if(CUR_TICKER) loadBands(CUR_TICKER); }));
-
-// ---- 우측: 신호등 ----
-async function loadSignals(ticker){
-  const body = $("#sig-body"), meta = $("#sig-meta");
-  body.innerHTML = `<div class="muted-note">불러오는 중…</div>`;
-  let d;
-  try{
-    const r = await fetch(`${API_BASE}/api/chart/signals?ticker=${ticker}&basis=${BAND_B}`);
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    d = await r.json();
-  }catch(e){ meta.textContent=""; body.innerHTML=`<div class="muted-note">조회 실패: ${e.message}</div>`; return; }
-
-  const lamp = c => `<span class="lamp ${c}"></span>`;
-  const trend = d.frames.map(f=> f.available
-    ? `<tr><td>${f.tf}</td><td>${f.passed}/${f.total}</td><td>${lamp(f.light)}</td></tr>`
-    : `<tr><td>${f.tf}</td><td colspan="2" style="color:var(--muted);font-size:10px">${(f.reason||"").slice(0,20)}</td></tr>`
-  ).join("");
-
-  const v = d.valuation||{}, m = v.metrics||{};
-  const val = Object.keys(m).map(k=>{
-    const x=m[k];
-    return `<tr><td>${k}</td><td>${x.current.toFixed(2)}</td><td>${x.z>=0?'+':''}${x.z.toFixed(1)}σ</td><td>${lamp(x.light)}</td></tr>`;
-  }).join("");
-
-  const ok = d.frames.filter(f=>f.available);
-  const allGreen = ok.length && ok.every(f=>f.light==="green");
-  meta.innerHTML = allGreen ? `<span class="vd bull">추세 정렬</span>` : "";
-
-  body.innerHTML = `
-    <div class="sechead">추세 (Minervini · 기간 환산)</div>
-    <table id="sig-table"><tr><th>TF</th><th>조건</th><th></th></tr>${trend}</table>
-    <div class="sechead">밸류에이션 (${v.basis||"-"})</div>
-    ${val ? `<table id="sig-table"><tr><th>지표</th><th>현재</th><th>편차</th><th></th></tr>${val}</table>`
-          : `<div class="muted-note">${(v.error||"재무 데이터 없음")}</div>`}
-    <div class="muted-note">주/월봉은 MA 기간을 환산해 적용(일 50/150/200 → 주 10/30/40 → 월 3/7/10).</div>`;
-}
-
-// ---- 우측: 멀티타임프레임 ----
-async function loadMTF(ticker){
-  const body = $("#mtf-body"), meta = $("#mtf-meta");
-  body.innerHTML = `<div class="muted-note">불러오는 중…</div>`;
-  let d;
-  try {
-    const r = await fetch(`${API_BASE}/api/chart/mtf?ticker=${ticker}`);
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    d = await r.json();
-  } catch(e){
-    meta.textContent = "";
-    body.innerHTML = `<div class="muted-note">조회 실패: ${e.message}</div>`;
-    return;
-  }
-  const cls = v => v==="강세" ? "bull" : (v==="약세" ? "bear" : "flat");
-  const rows = d.frames.map(f=>{
-    if(!f.available){
-      return `<tr><td>${f.tf}</td><td colspan="4" style="text-align:left;color:var(--muted);font-size:10px">
-              ${(f.reason||"데이터 없음").slice(0,32)}</td></tr>`;
-    }
-    const chg = f.chg_pct==null ? "-" :
-      `<span class="${f.chg_pct>=0?'up':'dn'}">${f.chg_pct>=0?'+':''}${f.chg_pct.toFixed(2)}%</span>`;
-    return `<tr>
-      <td>${f.tf}</td>
-      <td>${chg}</td>
-      <td>${f.above_ma20==null?'-':(f.above_ma20?'<span class="up">위</span>':'<span class="dn">아래</span>')}</td>
-      <td>${f.rsi==null?'-':f.rsi.toFixed(0)}</td>
-      <td><span class="vd ${cls(f.verdict)}">${f.verdict}</span></td>
-    </tr>`;
-  }).join("");
-
-  const ok = d.frames.filter(f=>f.available);
-  const agree = ok.length && ok.every(f=>f.verdict===ok[0].verdict) ? ok[0].verdict : null;
-  meta.innerHTML = agree ? `<span class="vd ${cls(agree)}">${agree} 일치</span>` : "";
-
-  body.innerHTML = `<table id="mtf-table">
-      <tr><th>TF</th><th>등락</th><th>MA20</th><th>RSI</th><th>판정</th></tr>${rows}
-    </table>
-    <div class="muted-note">판정 = MA20·RSI·스퀴즈 3지표 합산(±3). 분봉은 KIS, 일봉은 KRX.</div>`;
-}
-
-// ---- 우측: 포워드 컨센서스 ----
-const eok = (v) => {           // 억원 -> 읽기 쉬운 표기
-  if (v === null || v === undefined) return "-";
-  const a = Math.abs(v);
-  if (a >= 10000) return (v/10000).toFixed(1) + "조";
-  return Math.round(v).toLocaleString() + "억";
-};
-const num = (v, d=2) => (v === null || v === undefined) ? "-" : v.toFixed(d);
-
-function renderEstimates(est, lastClose){
-  const body = $("#est-body"), meta = $("#est-meta");
-  if (!est || !est.available){
-    meta.textContent = "";
-    body.innerHTML = `<div class="muted-note">${est?.reason || "데이터 없음"}</div>`;
-    return;
-  }
-  const opCls = /매수|Buy|강력/.test(est.opinion||"") ? "buy" : "hold";
-  const ed = est.est_date ? `${est.est_date.slice(0,4)}-${est.est_date.slice(4,6)}-${est.est_date.slice(6)}` : "-";
-  meta.innerHTML = est.opinion ? `<span class="op ${opCls}">${est.opinion}</span>` : "";
-
-  const rows = est.rows.map(r=>`
-    <tr class="${r.is_estimate?'est':''}">
-      <td>${r.period}</td>
-      <td>${eok(r.revenue)}</td>
-      <td>${eok(r.op_profit)}</td>
-      <td>${num(r.op_margin,1)}%</td>
-      <td>${num(r.per,1)}</td>
-      <td>${num(r.pbr,2)}</td>
-    </tr>`).join("");
-
-  // 추정 구간 요약
-  const e1 = est.rows.find(r=>r.is_estimate);
-  const summary = e1 ? `
-    <div style="display:flex;gap:8px;margin:8px 0 6px">
-      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
-        <div class="sub">${e1.period} PER</div>
-        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.per,1)}배</div>
-      </div>
-      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
-        <div class="sub">${e1.period} PBR</div>
-        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.pbr,2)}배</div>
-      </div>
-    </div>` : "";
-
-  body.innerHTML = summary + `
-    <table id="est-table">
-      <tr><th>기간</th><th>매출</th><th>영업익</th><th>OPM</th><th>PER</th><th>PBR</th></tr>
-      ${rows}
-    </table>
-    <div class="muted-note">
-      시총 ${eok(est.mktcap_eok)} · 자본 ${eok(est.equity_eok)} · 추정일 ${ed}${est.analyst?` · ${est.analyst}`:""}
-    </div>
-    <div class="muted-note">${est.pbr_note}</div>
-    <div class="warn">
-      ⚠️ <b>E 행은 증권사 추정치</b>입니다. 실적이 아니며 컨센서스는 자주 바뀝니다.
-      포워드 배수는 현재 시가총액 ÷ 추정치라, 추정이 틀리면 배수도 틀립니다.
-      숫자가 이례적이면 원자료(리포트)를 직접 확인하세요.
-    </div>`;
-}
-
-// ---- API ----
 async function loadTicker(code){
   hideBanner();
+  CUR_TICKER = code;
   try{
-    const r = await fetch(`${API_BASE}/api/chart/full?ticker=${code}&days=280`);
+    // 로컬 서버는 온디맨드라 기간을 늘려도 호출 1회다(OHLCV 10년 ≈ 0.1초).
+    const r = await fetch(`${API_BASE}/api/chart/full?ticker=${code}&days=${PERIOD}&tf=${TF}`);
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
+    RAW = d;
     render(d);
     if (d.trading && !d.trading.available)
       showBanner("⚠ 수급 데이터 비활성: " + d.trading.reason);
@@ -754,6 +339,16 @@ async function loadTicker(code){
     render(dummy());
   }
 }
+
+// ---- 봉 / 기간 전환 ----
+document.querySelectorAll(".tfb").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".tfb").forEach(x=>x.classList.toggle("on",x===b));
+  TF=b.dataset.tf; if(CUR_TICKER) loadTicker(CUR_TICKER);
+}));
+document.querySelectorAll(".pdb").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".pdb").forEach(x=>x.classList.toggle("on",x===b));
+  PERIOD=+b.dataset.d; if(CUR_TICKER) loadTicker(CUR_TICKER);
+}));
 
 // ---- 검색 (디바운스) ----
 let timer = null;

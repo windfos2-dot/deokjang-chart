@@ -284,7 +284,8 @@ def ohlcv(ticker: str = Query(..., min_length=6, max_length=6),
 # ---------------------------------------------------------------------------
 @router.get("/full")
 def full(ticker: str = Query(..., min_length=6, max_length=6),
-         days: int = Query(280, ge=30, le=2000),
+         days: int = Query(280, ge=30, le=6000),
+         tf: str = Query("D", pattern="^[DWM]$"),
          sr_vol_thresh: float = Query(20.0, ge=-100.0, le=500.0)):
     """OHLCV + 전체 지표 + 수급.
 
@@ -296,6 +297,39 @@ def full(ticker: str = Query(..., min_length=6, max_length=6),
         o = loader.get_ohlcv(ticker, days=days)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=404, detail=f"OHLCV 조회 실패({ticker}): {e}") from e
+
+    # --- 봉 재집계 (주/월) ---
+    # 클라이언트에서 재집계하면 서버가 계산한 지표(이동평균·패턴·오더블록…)와
+    # 봉이 어긋난다. 여기서 먼저 집계한 뒤 지표를 계산해야 전부 그 봉 기준이 된다.
+    if tf != "D":
+        def _key(dstr):
+            if tf == "W":
+                y, w, _ = date(int(dstr[:4]), int(dstr[5:7]), int(dstr[8:10])).isocalendar()
+                return f"{y}-W{w:02d}"
+            return dstr[:7]
+
+        agg, order = {}, []
+        for i, dstr in enumerate(o["dates"]):
+            k = _key(dstr)
+            if k not in agg:
+                agg[k] = {"d": dstr, "o": o["open"][i], "h": o["high"][i],
+                          "l": o["low"][i], "c": o["close"][i], "v": o["volume"][i]}
+                order.append(k)
+            else:
+                b = agg[k]
+                b["h"] = max(b["h"], o["high"][i])
+                b["l"] = min(b["l"], o["low"][i])
+                b["c"] = o["close"][i]
+                b["v"] += o["volume"][i]
+                b["d"] = dstr
+        o = {**o,
+             "dates": [agg[k]["d"] for k in order],
+             "open": [agg[k]["o"] for k in order],
+             "high": [agg[k]["h"] for k in order],
+             "low": [agg[k]["l"] for k in order],
+             "close": [agg[k]["c"] for k in order],
+             "volume": [agg[k]["v"] for k in order],
+             "tf": tf}
 
     # --- 옵션: 벤치마크 지수 (Minervini RS용). 실패해도 차트는 떠야 한다 ---
     bench = None
