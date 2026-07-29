@@ -56,7 +56,11 @@
   .tf{background:var(--panel);color:var(--muted);border:0;padding:5px 12px;
       font-size:12px;cursor:pointer;font-family:inherit}
   .tf + .tf{border-left:1px solid var(--border)}
-  .tf.on{background:var(--accent);color:#06231f;font-weight:600}
+  .tf.on,.mt.on,.bp.on{background:var(--accent);color:#06231f;font-weight:600}
+  .mt,.bp{background:var(--panel);color:var(--muted);border:0;padding:3px 9px;
+          font-size:11px;cursor:pointer;font-family:inherit}
+  .mt + .mt,.bp + .bp{border-left:1px solid var(--border)}
+  .mt:hover:not(.on),.bp:hover:not(.on){background:#1b2432;color:var(--text)}
   .tf:hover:not(.on){background:#1b2432;color:var(--text)}
   #tfnote{color:#f5c77e;font-size:11px;padding:0 14px 4px}
   footer{padding:14px;color:var(--muted);font-size:11px;text-align:center;
@@ -96,6 +100,20 @@
   <div id="charts" style="display:none">
     <div class="panel"><div class="ptitle"><span>가격 · 이동평균 · 볼린저 · 패턴</span><span id="leg"></span></div>
       <div id="main-chart" style="height:430px"></div><div id="patlist" style="padding:6px 10px"></div></div>
+    <div class="panel" id="band-panel">
+      <div class="ptitle">
+        <span>역사적 밸류에이션 밴드
+          <span class="tfgroup" style="margin-left:8px">
+            <button class="mt on" data-m="PER">PER</button><button class="mt" data-m="PBR">PBR</button><button class="mt" data-m="POR">POR</button><button class="mt" data-m="ROE">ROE</button>
+          </span>
+          <span class="tfgroup" style="margin-left:6px">
+            <button class="bp" data-y="1">1년</button><button class="bp" data-y="3">3년</button><button class="bp on" data-y="5">5년</button><button class="bp" data-y="10">10년</button>
+          </span>
+        </span>
+        <span id="band-note"></span>
+      </div>
+      <div id="band-chart" style="height:200px"></div>
+    </div>
     <div class="panel"><div class="ptitle"><span>거래량</span></div><div id="vol-chart" style="height:110px"></div></div>
     <div class="panel"><div class="ptitle"><span>RSI(14) · Bear 다이버전스 ▼</span></div><div id="rsi-chart" style="height:130px"></div></div>
     <div class="panel"><div class="ptitle"><span>스퀴즈 모멘텀 (LazyBear)</span></div><div id="sqz-chart" style="height:130px"></div></div>
@@ -125,6 +143,18 @@ function isoWeekKey(s){
 
 function resample(d, tf){
   if (tf === "D") return d;
+
+  // 빌드 때 저장해 둔 10년 주/월봉이 있으면 그걸 쓴다.
+  // 일봉(280개=약 13개월)을 재집계하면 월봉이 14개뿐이라 장기 흐름이 안 보인다.
+  const stored = tf === "W" ? d.w : d.m;
+  if (stored && stored.length){
+    return {...d,
+      dates: stored.map(b=>b[0]),
+      o: stored.map(b=>b[1]), h: stored.map(b=>b[2]),
+      l: stored.map(b=>b[3]), c: stored.map(b=>b[4]), v: stored.map(b=>b[5]),
+      _long:true};
+  }
+
   const keyOf = tf === "W" ? isoWeekKey : (s => s.slice(0,7));
   const buckets = new Map();
   for (let i = 0; i < d.dates.length; i++){
@@ -162,6 +192,8 @@ const volChart  = LightweightCharts.createChart($("#vol-chart"),  {...COMMON, he
 const rsiChart  = LightweightCharts.createChart($("#rsi-chart"),  {...COMMON, height:130});
 const sqzChart  = LightweightCharts.createChart($("#sqz-chart"),  {...COMMON, height:130});
 const aaChart   = LightweightCharts.createChart($("#aa-chart"),   {...COMMON, height:140});
+// 밴드는 월말 기준이라 시간축을 다른 패널과 공유하지 않는다(동기화 대상 제외)
+const bandChart = LightweightCharts.createChart($("#band-chart"), {...COMMON, height:200});
 const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart];
 
 const candle = mainChart.addCandlestickSeries({
@@ -323,11 +355,87 @@ function render(src){
   } else $("#mnv").innerHTML="";
 
   applyToggles();
+  renderBand();
   // autoSize 의 ResizeObserver 는 비동기라, 폭이 확정된 다음 프레임에 맞춘다
   requestAnimationFrame(()=>requestAnimationFrame(()=>{
     CHARTS.forEach(c=>c.timeScale().fitContent());
   }));
 }
+
+// ---- 역사적 밸류에이션 밴드 ----
+let BAND_M = "PER", BAND_Y = 5;
+const bandLine = bandChart.addLineSeries({color:"#38bdf8", lineWidth:2, priceLineVisible:false});
+const bandRefs = ["#f0b90b","#8b97a8","#8b97a8","#5d6d7e","#5d6d7e"].map((c,i)=>
+  bandChart.addLineSeries({color:c, lineWidth:1,
+    lineStyle: i===0?0:(i<3?2:3), priceLineVisible:false, lastValueVisible:i===0}));
+
+/* 해당 시점에 '공시되어 알 수 있었던' 회계연도.
+   FY Y 사업보고서는 이듬해 3월경 제출되므로 4월 이후라야 FY(Y-1)을 쓸 수 있다.
+   이 처리를 안 하면 미래 실적으로 과거 PER 을 그리는 선행편향(look-ahead)이 생긴다. */
+function reportedFY(dateStr){
+  const y = +dateStr.slice(0,4), m = +dateStr.slice(5,7);
+  return m >= 4 ? y - 1 : y - 2;
+}
+
+function computeBand(d, metric){
+  if(!d.m || !d.fin) return null;
+  const pts = [];
+  for(const b of d.m){
+    const date = b[0], cap = b[6];
+    if(!cap) continue;
+    const fy = d.fin[String(reportedFY(date))];
+    if(!fy) continue;
+    let v = null;
+    if(metric==="PER" && fy.ni > 0)      v = cap / fy.ni;
+    else if(metric==="PBR" && fy.eq > 0) v = cap / fy.eq;
+    else if(metric==="POR" && fy.op > 0) v = cap / fy.op;
+    else if(metric==="ROE" && fy.eq)     v = fy.ni / fy.eq * 100;
+    if(v!=null && isFinite(v)) pts.push({time:date, value:v});
+  }
+  return pts;
+}
+
+function renderBand(){
+  const d = CUR, note = $("#band-note");
+  if(!d || !d.m || !d.fin){
+    bandLine.setData([]); bandRefs.forEach(s=>s.setData([]));
+    note.textContent = d ? "재무 데이터 없음 (한국 시총 1,000억 이상만 제공)" : "";
+    return;
+  }
+  let pts = computeBand(d, BAND_M);
+  if(!pts || !pts.length){
+    bandLine.setData([]); bandRefs.forEach(s=>s.setData([]));
+    note.textContent = `${BAND_M} 산출 불가 (적자 등)`;
+    return;
+  }
+  pts = pts.slice(-BAND_Y*12);                    // 월말 기준이라 12개 = 1년
+  bandLine.setData(pts);
+
+  const vals = pts.map(p=>p.value);
+  const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+  const sd = Math.sqrt(vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length);
+  const t0 = pts[0].time, t1 = pts[pts.length-1].time;
+  [mean, mean+sd, mean-sd, mean+2*sd, mean-2*sd].forEach((lv,i)=>
+    bandRefs[i].setData([{time:t0,value:lv},{time:t1,value:lv}]));
+
+  const cur = vals[vals.length-1];
+  const z = sd ? (cur-mean)/sd : 0;
+  const pct = vals.filter(v=>v<=cur).length/vals.length*100;
+  note.innerHTML = `현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · ` +
+    `평균 ${mean.toFixed(2)} · σ ${sd.toFixed(2)} · ` +
+    `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · ` +
+    `하위 ${pct.toFixed(0)}% · ${pts.length}개월`;
+  requestAnimationFrame(()=>bandChart.timeScale().fitContent());
+}
+
+document.querySelectorAll(".mt").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".mt").forEach(x=>x.classList.toggle("on",x===b));
+  BAND_M=b.dataset.m; renderBand();
+}));
+document.querySelectorAll(".bp").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".bp").forEach(x=>x.classList.toggle("on",x===b));
+  BAND_Y=+b.dataset.y; renderBand();
+}));
 
 function applyToggles(){
   MA.forEach(s=>s.applyOptions({visible:$("#t-ma").checked}));

@@ -43,8 +43,16 @@ DOCS = os.path.join(ROOT, "docs")
 DATA = os.path.join(DOCS, "data")
 
 KRX_BASE = "https://data-dbg.krx.co.kr/svc/apis"
-BARS = 280                    # 차트 봉 수 (MA200 계산에 여유)
+BARS = 280                    # 일봉 수 (MA200 계산에 여유)
 SUPPLY_TOP = 300              # 수급/공매도를 붙일 한국 시총 상위 N
+
+# --- 장기 시계열 (밸류에이션 밴드 · 주/월봉용) ---
+# 일봉을 10년치 다 담으면 종목당 용량이 9배가 되므로, 최근 구간만 일봉으로 두고
+# 장기는 주봉/월봉으로 압축해 저장한다. 밴드는 월말 시가총액이면 충분하다.
+LONG_YEARS = 10
+WEEK_BARS = 520               # 10년 주봉
+MONTH_BARS = 120              # 10년 월봉
+MIN_MKTCAP = 1e11             # 시총 하한 (1,000억) — 이하 종목은 제외
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +385,240 @@ def us_collect(symbols, batch=200, keep=None):
 
 
 # ---------------------------------------------------------------------------
+# 장기 시계열 (10년) — 주/월봉 + 월말 시가총액
+# ---------------------------------------------------------------------------
+def kr_collect_long(key, min_cap=MIN_MKTCAP, years=LONG_YEARS, workers=12):
+    """KRX 오픈API 로 10년치 일봉을 모아 주/월봉 + 월말 시총으로 압축한다.
+
+    - 호출 수가 종목 수와 무관하다(날짜 1개 = 전종목). 10년 ≈ 2,450거래일 × 2시장.
+    - 메모리를 아끼려고 최근 시총으로 유니버스를 먼저 좁힌 뒤 누적한다.
+    - pykrx 웹로그인과 무관한 경로라 계정 잠금 영향을 받지 않는다.
+    """
+    # 1) 최근 거래일로 유니버스 + 시총 확보
+    recent = None
+    for ds in kr_candidate_days(10)[::-1]:
+        rows = krx_get("sto/stk_bydd_trd", {"basDd": ds}, key)
+        if rows:
+            recent = ds
+            break
+    if not recent:
+        log("[LONG] 최근 거래일 확보 실패")
+        return {}
+
+    universe = {}
+    for ep, mkt in (("sto/stk_bydd_trd", "KOSPI"), ("sto/ksq_bydd_trd", "KOSDAQ")):
+        for r in krx_get(ep, {"basDd": recent}, key):
+            try:
+                cap = float(r.get("MKTCAP", "0").replace(",", ""))
+            except (ValueError, AttributeError):
+                continue
+            if cap >= min_cap and r.get("ISU_CD"):
+                universe[r["ISU_CD"]] = (r.get("ISU_NM", ""), mkt, cap)
+    log(f"[LONG] 시총 {min_cap/1e8:,.0f}억 이상 {len(universe):,}종목 (기준일 {recent})")
+    if not universe:
+        return {}
+
+    # 2) 10년치 날짜 일괄 수집
+    days = []
+    d = datetime.strptime(recent, "%Y%m%d")
+    end = d - timedelta(days=int(365.25 * years))
+    while d >= end:
+        if d.weekday() < 5:
+            days.append(d.strftime("%Y%m%d"))
+        d -= timedelta(days=1)
+    jobs = [(ds, ep, mkt) for ds in days
+            for ep, mkt in (("sto/stk_bydd_trd", "KOSPI"), ("sto/ksq_bydd_trd", "KOSDAQ"))]
+    log(f"[LONG] {len(days):,}일 × 2시장 = {len(jobs):,} calls, 병렬 {workers}")
+
+    # 종목별 (날짜 -> ohlcv+cap). 유니버스에 든 종목만 담는다.
+    acc = defaultdict(dict)
+    t0 = time.time()
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(krx_get, ep, {"basDd": ds}, key): ds for ds, ep, mkt in jobs}
+        for fut in as_completed(futs):
+            ds = futs[fut]
+            try:
+                rows = fut.result()
+            except Exception:  # noqa: BLE001
+                rows = []
+            for r in rows:
+                code = r.get("ISU_CD")
+                if code not in universe:
+                    continue
+                try:
+                    acc[code][ds] = (
+                        float(r["TDD_OPNPRC"].replace(",", "")),
+                        float(r["TDD_HGPRC"].replace(",", "")),
+                        float(r["TDD_LWPRC"].replace(",", "")),
+                        float(r["TDD_CLSPRC"].replace(",", "")),
+                        float(r["ACC_TRDVOL"].replace(",", "")),
+                        float(r.get("MKTCAP", "0").replace(",", "")),
+                    )
+                except (KeyError, ValueError, AttributeError):
+                    continue
+            done += 1
+            if done % 800 == 0:
+                log(f"[LONG]   {done:,}/{len(jobs):,} ({time.time()-t0:.0f}s)")
+    log(f"[LONG] 수집 완료 {len(acc):,}종목 ({time.time()-t0:.0f}s)")
+
+    # 3) 주봉/월봉/월말시총으로 압축
+    out = {}
+    for code, bydate in acc.items():
+        ds_sorted = sorted(bydate)
+        if len(ds_sorted) < 60:
+            continue
+        name, mkt, cap = universe[code]
+        out[code] = {
+            "name": name, "market": mkt, "cap": cap,
+            "weekly": _agg(bydate, ds_sorted, "W")[-WEEK_BARS:],
+            "monthly": _agg(bydate, ds_sorted, "M")[-MONTH_BARS:],
+        }
+    log(f"[LONG] 압축 완료 {len(out):,}종목")
+    return out
+
+
+def _agg(bydate, ds_sorted, mode):
+    """일봉 dict -> 주/월봉 리스트. 각 원소 [date, o, h, l, c, v, mktcap(말일)]"""
+    buckets = {}
+    order = []
+    for ds in ds_sorted:
+        o, h, l, c, v, cap = bydate[ds]
+        if mode == "W":
+            dt = datetime.strptime(ds, "%Y%m%d")
+            y, w, _ = dt.isocalendar()
+            k = f"{y}-W{w:02d}"
+        else:
+            k = ds[:6]
+        b = buckets.get(k)
+        if b is None:
+            buckets[k] = [f"{ds[:4]}-{ds[4:6]}-{ds[6:]}", o, h, l, c, v, cap]
+            order.append(k)
+        else:
+            b[0] = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
+            b[2] = max(b[2], h)
+            b[3] = min(b[3], l)
+            b[4] = c
+            b[5] += v
+            b[6] = cap
+    return [buckets[k] for k in order]
+
+
+# ---------------------------------------------------------------------------
+# DART 재무 (밸류에이션 밴드용)
+# ---------------------------------------------------------------------------
+# PBR = 시총/자본총계, PER = 시총/당기순이익, POR = 시총/영업이익,
+# ROE = 당기순이익/자본총계.  연간(사업보고서) 기준으로 10년치를 모은다.
+DART_BASE = "https://opendart.fss.or.kr/api"
+DART_BATCH = 10               # fnlttMultiAcnt 는 corp_code 를 콤마로 여러 개 받는다
+_DART_WANT = {
+    "매출액": "rev",
+    "영업이익": "op",
+    "당기순이익(손실)": "ni",
+    "자본총계": "eq",
+}
+
+
+def _dart_key():
+    key = os.getenv("OPENDART_API_KEY")
+    if key:
+        return key
+    import re
+    for path in (os.path.join(ROOT, ".env"),
+                 os.path.join(ROOT, os.pardir, "stock-bot", ".env")):
+        try:
+            with open(os.path.normpath(path), encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"\s*OPENDART_API_KEY\s*=\s*(.+?)\s*$", line)
+                    if m:
+                        return m.group(1).strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return None
+
+
+def dart_corp_map():
+    """종목코드 -> corp_code 매핑 (3.6MB 1회 다운로드)."""
+    key = _dart_key()
+    if not key:
+        return {}
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+    try:
+        with urllib.request.urlopen(
+                f"{DART_BASE}/corpCode.xml?crtfc_key={key}", timeout=90) as r:
+            raw = r.read()
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        root = ET.fromstring(z.read(z.namelist()[0]).decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        log(f"[DART] corp_code 실패: {e}")
+        return {}
+    m = {}
+    for c in root.iter("list"):
+        sc = (c.findtext("stock_code") or "").strip()
+        if sc:
+            m[sc] = c.findtext("corp_code")
+    log(f"[DART] corp_code 매핑 {len(m):,}종목")
+    return m
+
+
+def dart_financials(tickers, years=LONG_YEARS, workers=6):
+    """연도별 재무. 반환: {ticker: {year: {rev, op, ni, eq}}}"""
+    key = _dart_key()
+    if not key:
+        log("[DART] OPENDART_API_KEY 없음 -> 밴드 생략")
+        return {}
+    cmap = dart_corp_map()
+    pairs = [(t, cmap[t]) for t in tickers if t in cmap]
+    if not pairs:
+        return {}
+
+    this_year = datetime.now().year
+    yrs = list(range(this_year - years, this_year + 1))
+    batches = [pairs[i:i + DART_BATCH] for i in range(0, len(pairs), DART_BATCH)]
+    rev_map = {c: t for t, c in pairs}
+    out = defaultdict(dict)
+
+    def fetch(args):
+        yr, batch = args
+        codes = ",".join(c for _, c in batch)
+        url = (f"{DART_BASE}/fnlttMultiAcnt.json?crtfc_key={key}"
+               f"&corp_code={codes}&bsns_year={yr}&reprt_code=11011")
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                return yr, json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return yr, {}
+
+    jobs = [(yr, b) for yr in yrs for b in batches]
+    log(f"[DART] {len(pairs):,}종목 × {len(yrs)}년 = {len(jobs):,} calls, 병렬 {workers}")
+    t0, done = time.time(), 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for yr, d in ex.map(fetch, jobs):
+            done += 1
+            for it in (d.get("list") or []):
+                # 연결(CFS) 우선, 없으면 개별(OFS)
+                fld = _DART_WANT.get(it.get("account_nm"))
+                if not fld:
+                    continue
+                tk = rev_map.get(it.get("corp_code"))
+                if not tk:
+                    continue
+                try:
+                    val = float(str(it.get("thstrm_amount", "")).replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                slot = out[tk].setdefault(yr, {})
+                if it.get("fs_div") == "CFS" or fld not in slot:
+                    slot[fld] = val
+            if done % 300 == 0:
+                log(f"[DART]   {done:,}/{len(jobs):,} ({time.time()-t0:.0f}s)")
+    log(f"[DART] 완료 {len(out):,}종목 ({time.time()-t0:.0f}s)")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 지수
 # ---------------------------------------------------------------------------
 # 한국 지수는 pykrx(KRX 로그인 필요), 해외는 yfinance.
@@ -460,7 +702,7 @@ def collect_indices():
 # ---------------------------------------------------------------------------
 # 종목 1개 -> JSON
 # ---------------------------------------------------------------------------
-def build_one(code, name, market, s, with_supply=False):
+def build_one(code, name, market, s, with_supply=False, long_data=None, fin=None):
     dates = s["dates"][-BARS:]
     o = s["open"][-BARS:]; h = s["high"][-BARS:]
     lo = s["low"][-BARS:]; c = s["close"][-BARS:]; v = s["volume"][-BARS:]
@@ -502,6 +744,18 @@ def build_one(code, name, market, s, with_supply=False):
         "order_blocks": r["order_blocks"],
         "minervini": r["minervini"]["latest"],
     }
+
+    # --- 장기 시계열 (주/월봉) + 월말 시가총액 ---
+    if long_data:
+        out["w"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5])]
+                    for b in long_data.get("weekly", [])]
+        out["m"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5]), int(b[6])]
+                    for b in long_data.get("monthly", [])]
+
+    # --- DART 연간 재무 (밸류에이션 밴드용) ---
+    if fin:
+        out["fin"] = {str(y): {k: int(v) for k, v in d.items()}
+                      for y, d in sorted(fin.items())}
     return out
 
 
@@ -514,6 +768,10 @@ def main():
     ap.add_argument("--us-limit", type=int, default=None)
     ap.add_argument("--skip-us", action="store_true")
     ap.add_argument("--skip-kr", action="store_true")
+    ap.add_argument("--min-cap", type=float, default=MIN_MKTCAP,
+                    help="시총 하한(원). 기본 1e11=1,000억. 0이면 전종목")
+    ap.add_argument("--skip-long", action="store_true", help="장기 주/월봉 생략")
+    ap.add_argument("--skip-dart", action="store_true", help="DART 재무 생략")
     args = ap.parse_args()
 
     os.makedirs(os.path.join(DATA, "KR"), exist_ok=True)
@@ -542,10 +800,27 @@ def main():
         else:
             log("[KR] KRX_API_KEY 없음 -> pykrx 폴백(KRX 웹 로그인) 사용")
             items, series = kr_collect_pykrx(args.kr_limit)
+        # 시총 하한 필터 (기본 1,000억) — 소형주는 데이터도 지표도 신뢰도가 낮다
+        if args.min_cap > 0:
+            before = len(items)
+            items = [it for it in items if it[3] >= args.min_cap]
+            log(f"[KR] 시총 {args.min_cap/1e8:,.0f}억 필터: {before} -> {len(items)}종목")
+
+        # 장기 시계열(주/월봉) + DART 재무 — 밸류에이션 밴드용
+        long_map, fin_map = {}, {}
+        if items and not args.skip_long:
+            if key:
+                long_map = kr_collect_long(key, min_cap=args.min_cap or MIN_MKTCAP)
+            else:
+                log("[LONG] KRX_API_KEY 없음 -> 장기 시계열 생략")
+        if items and not args.skip_dart:
+            fin_map = dart_financials([it[0] for it in items])
+
         if items:
             ok = 0
             for i, (code, name, mkt, cap) in enumerate(items, 1):
-                doc = build_one(code, name, mkt, series[code])
+                doc = build_one(code, name, mkt, series[code],
+                                long_data=long_map.get(code), fin=fin_map.get(code))
                 if not doc:
                     continue
                 with open(os.path.join(DATA, "KR", f"{code}.json"), "w",
