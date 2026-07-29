@@ -65,6 +65,22 @@
   .vd.bull{background:#0f3f33;color:#4ade80}
   .vd.bear{background:#3f1620;color:#f87171}
   .vd.flat{background:#26303f;color:#9aa7b8}
+  .btngroup{display:inline-flex;border:1px solid var(--border);border-radius:5px;overflow:hidden}
+  .bm,.bb,.by{background:#0e131c;color:var(--muted);border:0;padding:3px 8px;
+              font-size:11px;cursor:pointer;font-family:inherit}
+  .bm+.bm,.bb+.bb,.by+.by{border-left:1px solid var(--border)}
+  .bm.on,.bb.on,.by.on{background:var(--accent);color:#06231f;font-weight:600}
+  .bm:hover:not(.on),.bb:hover:not(.on),.by:hover:not(.on){background:#1b2432;color:var(--text)}
+  #sig-table{width:100%;border-collapse:collapse;font-size:11px}
+  #sig-table td,#sig-table th{padding:4px 5px;border-bottom:1px solid #1b2432;white-space:nowrap}
+  #sig-table th{color:var(--muted);font-weight:500;text-align:right}
+  #sig-table td:first-child,#sig-table th:first-child{text-align:left;font-weight:600}
+  #sig-table td:not(:first-child){text-align:right}
+  .lamp{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px}
+  .lamp.green{background:#22c55e;box-shadow:0 0 6px #22c55e88}
+  .lamp.yellow{background:#facc15;box-shadow:0 0 6px #facc1588}
+  .lamp.red{background:#f87171;box-shadow:0 0 6px #f8717188}
+  .sechead{color:var(--muted);font-size:10.5px;margin:8px 0 3px}
   .up{color:#f87171} .dn{color:#60a5fa}
   .op{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600}
   .op.buy{background:#0f3f33;color:#4ade80} .op.hold{background:#3a3320;color:#f0c674}
@@ -159,6 +175,24 @@
     <div id="flow-chart" style="height:150px"></div>
   </div>
 
+  <div class="panel" id="band-panel">
+    <div class="ptitle">
+      <span>역사적 밸류에이션 밴드
+        <span class="btngroup" style="margin-left:8px">
+          <button class="bm on" data-m="PER">PER</button><button class="bm" data-m="PBR">PBR</button><button class="bm" data-m="POR">POR</button><button class="bm" data-m="ROE">ROE</button>
+        </span>
+        <span class="btngroup" style="margin-left:6px">
+          <button class="bb on" data-b="FY">FY확정</button><button class="bb" data-b="LTM">LTM</button>
+        </span>
+        <span class="btngroup" style="margin-left:6px">
+          <button class="by" data-y="1">1년</button><button class="by" data-y="3">3년</button><button class="by on" data-y="5">5년</button><button class="by" data-y="10">10년</button>
+        </span>
+      </span>
+      <span id="band-note" class="mk"></span>
+    </div>
+    <div id="band-chart" style="height:200px"></div>
+  </div>
+
   <div class="panel" id="short-panel">
     <div class="ptitle"><span>공매도 잔고 (수량 / 비중%)</span><span id="short-note" class="mk"></span></div>
     <div id="short-chart" style="height:140px"></div>
@@ -166,6 +200,9 @@
 </main>
 
 <aside id="side">
+  <h3>신호등 <span class="sub" id="sig-meta"></span></h3>
+  <div id="sig-body"><div class="muted-note">종목을 선택하세요</div></div>
+  <div style="height:14px"></div>
   <h3>멀티타임프레임 <span class="sub" id="mtf-meta"></span></h3>
   <div id="mtf-body"><div class="muted-note">불러오는 중…</div></div>
   <div style="height:14px"></div>
@@ -197,6 +234,8 @@ const sqzChart  = LightweightCharts.createChart($("#sqz-chart"),  {...COMMON, he
 const aaChart = LightweightCharts.createChart($("#aa-chart"), {...COMMON, height:150});
 const flowChart = LightweightCharts.createChart($("#flow-chart"), {...COMMON, height:150});
 const shortChart = LightweightCharts.createChart($("#short-chart"), {...COMMON, height:140});
+// 밴드는 회계 기준 시계열이라 다른 패널과 시간축을 공유하지 않는다
+const bandChart = LightweightCharts.createChart($("#band-chart"), {...COMMON, height:200});
 const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart, flowChart, shortChart];
 
 // 시리즈
@@ -271,10 +310,12 @@ window.addEventListener("resize", () => {
   aaChart.applyOptions({width: $("#aa-chart").clientWidth});
   flowChart.applyOptions({width: $("#flow-chart").clientWidth});
   shortChart.applyOptions({width: $("#short-chart").clientWidth});
+  bandChart.applyOptions({width: $("#band-chart").clientWidth});
 });
 
 // 동적 시리즈 (패턴 추세선 / 오더블록 박스)
 let patternSeries = [], obSeries = [];
+let CUR_TICKER = null;
 function clearDynamic(list){
   list.forEach((s) => { try { mainChart.removeSeries(s); } catch(e){} });
   list.length = 0;
@@ -482,9 +523,119 @@ function render(d){
   }
 
   renderEstimates(d.estimates, o.close[o.close.length-1]);
+  CUR_TICKER = d.ticker;
   loadMTF(d.ticker);       // 분봉은 별도 호출 (일봉 렌더를 막지 않도록 비동기)
+  loadSignals(d.ticker);
+  loadBands(d.ticker);
   applyToggles();          // 마커 + 시리즈 표시상태 일괄 적용
   mainChart.timeScale().fitContent();
+}
+
+// ---- 밸류에이션 밴드 ----
+let BAND_M = "PER", BAND_B = "FY", BAND_Y = 5, BAND_CACHE = {};
+const bandLine = bandChart.addLineSeries({color:"#38bdf8", lineWidth:2, priceLineVisible:false});
+const bandRefs = ["#f0b90b","#8b97a8","#8b97a8","#5d6d7e","#5d6d7e"].map((c,i)=>
+  bandChart.addLineSeries({color:c, lineWidth:1, lineStyle:i===0?0:(i<3?2:3),
+    priceLineVisible:false, lastValueVisible:i===0}));
+const bandFwd = bandChart.addLineSeries({color:"#4ade80", lineWidth:2, lineStyle:1,
+  priceLineVisible:false, lastValueVisible:true});
+
+async function loadBands(ticker){
+  const note = $("#band-note");
+  const ck = ticker + "|" + BAND_B;
+  if(!BAND_CACHE[ck]){
+    note.textContent = "불러오는 중… (최초 1회는 시총 수집으로 40초 정도)";
+    try{
+      const r = await fetch(`${API_BASE}/api/chart/bands?ticker=${ticker}&basis=${BAND_B}`);
+      BAND_CACHE[ck] = r.ok ? await r.json() : {available:false, reason:"HTTP "+r.status};
+    }catch(e){ BAND_CACHE[ck] = {available:false, reason:e.message}; }
+  }
+  renderBand();
+}
+
+function renderBand(){
+  const note = $("#band-note");
+  const d = BAND_CACHE[(CUR_TICKER||"") + "|" + BAND_B];
+  const clear = () => { bandLine.setData([]); bandFwd.setData([]); bandRefs.forEach(s=>s.setData([])); };
+  if(!d || !d.available){ clear(); note.textContent = d ? (d.reason||"데이터 없음") : ""; return; }
+
+  let pts = (d.series[BAND_M]||[]).map(x=>({time:x[0], value:x[1]}));
+  if(!pts.length){ clear(); note.textContent = `${BAND_M} 산출 불가 (적자 등)`; return; }
+  // 일별이므로 1년 ≈ 252봉
+  pts = pts.slice(-BAND_Y*252);
+  bandLine.setData(pts);
+
+  const vals = pts.map(p=>p.value);
+  const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+  const sd = Math.sqrt(vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length);
+  const t0 = pts[0].time, t1 = pts[pts.length-1].time;
+  [mean, mean+sd, mean-sd, mean+2*sd, mean-2*sd].forEach((lv,i)=>
+    bandRefs[i].setData([{time:t0,value:lv},{time:t1,value:lv}]));
+
+  // 포워드 배수를 수평선으로 얹어 현재 밸류가 역사 어디쯤인지 보이게 한다
+  let fwdTxt = "";
+  const fw = d.forward;
+  if(fw && (BAND_M==="PER"||BAND_M==="POR"||BAND_M==="PBR")){
+    const r0 = fw.rows.find(r=>r[BAND_M]!=null);
+    if(r0){
+      bandFwd.setData([{time:t0,value:r0[BAND_M]},{time:t1,value:r0[BAND_M]}]);
+      const fz = sd ? (r0[BAND_M]-mean)/sd : 0;
+      fwdTxt = ` · <span style="color:#4ade80">FWD ${r0.period} ${r0[BAND_M].toFixed(2)} (${fz>=0?'+':''}${fz.toFixed(1)}σ)</span>`;
+    } else bandFwd.setData([]);
+  } else bandFwd.setData([]);
+
+  const cur = vals[vals.length-1];
+  const z = sd ? (cur-mean)/sd : 0;
+  const pct = vals.filter(v=>v<=cur).length/vals.length*100;
+  note.innerHTML = `${d.basis} · 현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · 평균 ${mean.toFixed(2)} · ` +
+    `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt;
+  requestAnimationFrame(()=>bandChart.timeScale().fitContent());
+}
+
+document.querySelectorAll(".bm").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".bm").forEach(x=>x.classList.toggle("on",x===b));
+  BAND_M=b.dataset.m; renderBand(); }));
+document.querySelectorAll(".by").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".by").forEach(x=>x.classList.toggle("on",x===b));
+  BAND_Y=+b.dataset.y; renderBand(); }));
+document.querySelectorAll(".bb").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".bb").forEach(x=>x.classList.toggle("on",x===b));
+  BAND_B=b.dataset.b; if(CUR_TICKER) loadBands(CUR_TICKER); }));
+
+// ---- 우측: 신호등 ----
+async function loadSignals(ticker){
+  const body = $("#sig-body"), meta = $("#sig-meta");
+  body.innerHTML = `<div class="muted-note">불러오는 중…</div>`;
+  let d;
+  try{
+    const r = await fetch(`${API_BASE}/api/chart/signals?ticker=${ticker}&basis=${BAND_B}`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    d = await r.json();
+  }catch(e){ meta.textContent=""; body.innerHTML=`<div class="muted-note">조회 실패: ${e.message}</div>`; return; }
+
+  const lamp = c => `<span class="lamp ${c}"></span>`;
+  const trend = d.frames.map(f=> f.available
+    ? `<tr><td>${f.tf}</td><td>${f.passed}/${f.total}</td><td>${lamp(f.light)}</td></tr>`
+    : `<tr><td>${f.tf}</td><td colspan="2" style="color:var(--muted);font-size:10px">${(f.reason||"").slice(0,20)}</td></tr>`
+  ).join("");
+
+  const v = d.valuation||{}, m = v.metrics||{};
+  const val = Object.keys(m).map(k=>{
+    const x=m[k];
+    return `<tr><td>${k}</td><td>${x.current.toFixed(2)}</td><td>${x.z>=0?'+':''}${x.z.toFixed(1)}σ</td><td>${lamp(x.light)}</td></tr>`;
+  }).join("");
+
+  const ok = d.frames.filter(f=>f.available);
+  const allGreen = ok.length && ok.every(f=>f.light==="green");
+  meta.innerHTML = allGreen ? `<span class="vd bull">추세 정렬</span>` : "";
+
+  body.innerHTML = `
+    <div class="sechead">추세 (Minervini · 기간 환산)</div>
+    <table id="sig-table"><tr><th>TF</th><th>조건</th><th></th></tr>${trend}</table>
+    <div class="sechead">밸류에이션 (${v.basis||"-"})</div>
+    ${val ? `<table id="sig-table"><tr><th>지표</th><th>현재</th><th>편차</th><th></th></tr>${val}</table>`
+          : `<div class="muted-note">${(v.error||"재무 데이터 없음")}</div>`}
+    <div class="muted-note">주/월봉은 MA 기간을 환산해 적용(일 50/150/200 → 주 10/30/40 → 월 3/7/10).</div>`;
 }
 
 // ---- 우측: 멀티타임프레임 ----
