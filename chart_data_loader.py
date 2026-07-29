@@ -101,6 +101,11 @@ def _load_dotenv():
 _load_dotenv()
 
 
+# KRX 웹로그인 잠금 상태를 디스크에 남긴다.
+# 잠긴 계정에 매 프로세스마다 다시 로그인하면 잠금이 연장되고 로그도 지저분해진다.
+_KRX_LOCK_FILE = os.path.join(_CACHE_DIR, "krx_login_locked")
+_KRX_LOCK_TTL = 12 * 3600
+
 _krx_login_disabled = False
 
 
@@ -118,11 +123,63 @@ def disable_krx_login(reason=""):
     _krx_login_disabled = True
     os.environ.pop("KRX_ID", None)
     os.environ.pop("KRX_PW", None)
+    try:                                   # 다음 실행에서도 시도하지 않도록 기록
+        with open(_KRX_LOCK_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{time.time()}\n{reason}\n")
+    except OSError:
+        pass
     print(f"[loader] KRX 웹로그인 비활성화 (재시도 중단): {reason}")
 
 
 def krx_login_broken():
     return _krx_login_disabled
+
+
+def _restore_krx_lock():
+    """직전 실행에서 잠금이 확인됐으면 이번에도 로그인 시도를 건너뛴다."""
+    try:
+        age = time.time() - os.path.getmtime(_KRX_LOCK_FILE)
+    except OSError:
+        return
+    if age < _KRX_LOCK_TTL:
+        hrs = age / 3600
+        globals()["_krx_login_disabled"] = True
+        os.environ.pop("KRX_ID", None)
+        os.environ.pop("KRX_PW", None)
+        print(f"[loader] KRX 웹로그인 건너뜀 ({hrs:.1f}시간 전 잠금 확인). "
+              f"풀렸으면 {_KRX_LOCK_FILE} 삭제.")
+
+
+def _probe_krx_login():
+    """시작 시 1회만 로그인 상태를 확인하고 결과를 기록한다.
+
+    pykrx 는 로그인 실패 시 예외를 던지지 않고 메시지만 출력한다. 그래서
+    호출 래퍼로는 감지할 수 없고, 매 호출마다 재시도하며 로그를 어지럽힌다.
+    (잠긴 계정이면 시도 자체가 잠금을 연장시킨다)
+    여기서 한 번만 확인해 실패면 이후 프로세스 전체에서 건너뛴다.
+    """
+    if _krx_login_disabled or not krx_login_configured():
+        return
+    try:
+        from pykrx.website.comm import auth
+        s = requests.Session()
+        s.get(auth.LOGIN_PAGE, headers={"User-Agent": auth.USER_AGENT}, timeout=10)
+        s.get(auth.LOGIN_JSP, headers={"User-Agent": auth.USER_AGENT}, timeout=10)
+        r = s.post(auth.LOGIN_URL,
+                   data={"mbrNm": "", "telNo": "", "di": "", "certType": "",
+                         "mbrId": os.getenv("KRX_ID"), "pw": os.getenv("KRX_PW")},
+                   headers={"User-Agent": auth.USER_AGENT, "Referer": auth.LOGIN_PAGE},
+                   timeout=12)
+        body = r.json() or {}
+        code, msg = body.get("_error_code", ""), body.get("_error_message", "")
+    except Exception as e:  # noqa: BLE001
+        disable_krx_login(f"로그인 점검 실패: {type(e).__name__}")
+        return
+    if code not in ("CD001", "CD011"):        # CD001 정상, CD011 중복로그인
+        disable_krx_login(f"{code} {msg}")
+
+
+_restore_krx_lock()
 
 
 def _pykrx(fn, *a, **kw):
@@ -142,6 +199,11 @@ def _pykrx(fn, *a, **kw):
 def krx_login_configured():
     """KRX_ID/KRX_PW 환경변수 설정 여부 (수급·공매도·펀더멘털 가용성 판단용)."""
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
+
+
+# 점검은 krx_login_configured 정의 이후에 실행해야 한다(정의 순서 주의).
+if os.getenv("CHART_SKIP_KRX_PROBE") != "1":
+    _probe_krx_login()
 
 
 _KRX_LOGIN_HINT = (
