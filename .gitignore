@@ -9,7 +9,6 @@ __pycache__/
 .chart_cache/
 .DS_Store
 
-# 정적 빌드 산출물 (Actions 에서 생성, 커밋하지 않음)
-docs/data/
-docs/index.json
-docs/meta.json
+# 정적 빌드 산출물은 커밋한다 (스팩 트래커와 동일 방식).
+# build_static.py 를 로컬에서 돌려 docs/ 를 채우고 그대로 푸시하면
+# GitHub Pages 가 서빙한다. Actions 는 쓰지 않는다.

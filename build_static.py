@@ -189,6 +189,76 @@ def kr_collect(key, limit=None, workers=12):
     return items, series
 
 
+def kr_collect_pykrx(limit=None, workers=6):
+    """KRX_API_KEY 가 없을 때의 폴백 — pykrx(KRX 웹 로그인)로 동일 결과를 만든다.
+
+    오픈API 인증키는 별도 발급 절차가 필요한데, 이미 갖고 있는 KRX_ID/PW 만으로도
+    같은 '날짜 1개 = 전종목' 호출이 가능하다:
+        get_market_ohlcv_by_ticker(date, market="ALL")  -> 2,800여 종목 + 시가총액
+    호출 수가 종목 수와 무관하므로 오픈API 경로와 비용 구조가 같다(280 calls).
+    """
+    from pykrx import stock
+    import chart_data_loader as _loader
+
+    uni = _loader._load_universe()          # KIND 1콜: code -> {name, market}
+    log(f"[KR] 유니버스 {len(uni)}종목 (KIND)")
+
+    # 실제 거래일은 코스피 지수 시계열에서 얻는다(휴장일이 자동으로 빠진다).
+    end = datetime.now()
+    start = end - timedelta(days=int(BARS * 1.7))
+    idx = stock.get_index_ohlcv(start.strftime("%Y%m%d"),
+                                end.strftime("%Y%m%d"), "1001")
+    days = [d.strftime("%Y%m%d") for d in idx.index][-BARS:]
+    if not days:
+        log("[KR] 거래일 조회 실패")
+        return [], {}
+    log(f"[KR] 거래일 {len(days)}일: {days[0]} ~ {days[-1]}, 병렬 {workers}")
+
+    def fetch(ds):
+        try:
+            return ds, stock.get_market_ohlcv_by_ticker(ds, market="ALL")
+        except Exception:  # noqa: BLE001
+            return ds, None
+
+    fetched, t0, done = {}, time.time(), 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for ds, df in ex.map(fetch, days):
+            done += 1
+            if df is not None and not df.empty:
+                fetched[ds] = df
+            if done % 50 == 0:
+                log(f"[KR]   {done}/{len(days)} calls ({time.time()-t0:.0f}s)")
+    log(f"[KR] 수집 {len(fetched)}일 ({time.time()-t0:.0f}s)")
+
+    series = defaultdict(lambda: {"dates": [], "open": [], "high": [],
+                                  "low": [], "close": [], "volume": []})
+    caps = {}
+    for ds in sorted(fetched):
+        df = fetched[ds]
+        date_str = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
+        # iterrows 는 2,800행×280일에서 지나치게 느려 컬럼 단위로 훑는다.
+        cols = zip(df.index.tolist(), df["시가"].tolist(), df["고가"].tolist(),
+                   df["저가"].tolist(), df["종가"].tolist(),
+                   df["거래량"].tolist(), df["시가총액"].tolist())
+        for code, o, h, lo, c, v, cap in cols:
+            if code not in uni or not c or c <= 0:
+                continue
+            s = series[code]
+            s["dates"].append(date_str)
+            s["open"].append(float(o)); s["high"].append(float(h))
+            s["low"].append(float(lo)); s["close"].append(float(c))
+            s["volume"].append(float(v))
+            caps[code] = float(cap or 0)     # 마지막 날 값이 남는다
+
+    items = [(code, uni[code]["name"], uni[code]["market"], caps.get(code, 0))
+             for code in series]
+    items.sort(key=lambda x: -x[3])          # 시총 내림차순
+    if limit:
+        items = items[:limit]
+    log(f"[KR] 조립 완료: {len(series)}종목 -> 대상 {len(items)}종목")
+    return items, series
+
+
 # ---------------------------------------------------------------------------
 # 미국 — yfinance 배치
 # ---------------------------------------------------------------------------
@@ -243,8 +313,25 @@ def us_universe(limit=None):
     return uniq
 
 
-def us_collect(symbols, batch=200):
-    """yfinance 배치 다운로드 -> 종목별 시계열."""
+def us_turnover(s):
+    """최근 60일 '종가×거래량' 중앙값 — 유동성 대용치.
+
+    yfinance 는 시총을 배치로 주지 않으므로, 이미 받은 시계열만으로 계산할 수 있는
+    달러 거래대금을 대신 쓴다. 중앙값이라 하루짜리 이상거래에 흔들리지 않는다.
+    """
+    c, v = s["close"][-60:], s["volume"][-60:]
+    if not c:
+        return 0.0
+    vals = sorted(ci * vi for ci, vi in zip(c, v))
+    return vals[len(vals) // 2]
+
+
+def us_collect(symbols, batch=200, keep=None):
+    """yfinance 배치 다운로드 -> 종목별 시계열.
+
+    keep 을 주면 배치마다 거래대금 상위 keep 개만 남긴다. 전체 유니버스가
+    6,000종목 가까이라 전부 메모리에 들고 있으면 수백 MB 를 먹기 때문이다.
+    """
     import yfinance as yf
     series = {}
     syms = [s for s, _ in symbols]
@@ -278,7 +365,14 @@ def us_collect(symbols, batch=200):
                 }
             except Exception:  # noqa: BLE001
                 continue
+        if keep and len(series) > keep * 2:
+            series = dict(sorted(series.items(),
+                                 key=lambda kv: -us_turnover(kv[1]))[:keep])
         log(f"[US] {min(i + batch, len(syms))}/{len(syms)} (누적 {len(series)})")
+    if keep and len(series) > keep:
+        series = dict(sorted(series.items(),
+                             key=lambda kv: -us_turnover(kv[1]))[:keep])
+        log(f"[US] 거래대금 상위 {len(series)}종목 선별")
     return series
 
 
@@ -443,10 +537,12 @@ def main():
     # ---- 한국 ----
     if not args.skip_kr:
         key = _krx_key()
-        if not key:
-            log("[KR] KRX_API_KEY 없음 -> 한국 건너뜀")
-        else:
+        if key:
             items, series = kr_collect(key, args.kr_limit)
+        else:
+            log("[KR] KRX_API_KEY 없음 -> pykrx 폴백(KRX 웹 로그인) 사용")
+            items, series = kr_collect_pykrx(args.kr_limit)
+        if items:
             ok = 0
             for i, (code, name, mkt, cap) in enumerate(items, 1):
                 doc = build_one(code, name, mkt, series[code])
@@ -463,9 +559,11 @@ def main():
 
     # ---- 미국 ----
     if not args.skip_us:
-        uni = us_universe(args.us_limit)
+        # 유니버스는 심볼 알파벳순이라 앞에서 자르면 AA* 만 남는다.
+        # 전체를 받아 us_collect 안에서 거래대금 상위로 추린다.
+        uni = us_universe(None)
         if uni:
-            series = us_collect(uni)
+            series = us_collect(uni, keep=args.us_limit)
             namemap = dict(uni)
             ok = 0
             for i, (sym, sdata) in enumerate(series.items(), 1):
