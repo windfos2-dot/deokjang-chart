@@ -76,6 +76,11 @@
   #sig-table th{color:var(--muted);font-weight:500;text-align:right}
   #sig-table td:first-child,#sig-table th:first-child{text-align:left;font-weight:600}
   #sig-table td:not(:first-child){text-align:right}
+  .tip{position:absolute;display:none;pointer-events:none;z-index:80;
+       background:rgba(13,17,23,.96);border:1px solid var(--border);border-radius:6px;
+       padding:6px 9px;font-size:11.5px;line-height:1.5;white-space:nowrap;
+       box-shadow:0 4px 14px rgba(0,0,0,.5)}
+  .tip b{color:var(--text)} .tip .k{color:var(--muted);margin-right:6px}
   .lamp{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px}
   .lamp.green{background:#22c55e;box-shadow:0 0 6px #22c55e88}
   .lamp.yellow{background:#facc15;box-shadow:0 0 6px #facc1588}
@@ -192,7 +197,9 @@
       </span>
       <span id="band-note" class="mk"></span>
     </div>
-    <div id="band-chart" style="height:200px"></div>
+    <div id="band-chart" style="height:200px;position:relative">
+      <div class="tip" id="band-tip"></div>
+    </div>
   </div>
 
   <div class="panel" id="short-panel">
@@ -238,6 +245,47 @@ const flowChart = LightweightCharts.createChart($("#flow-chart"), {...COMMON, he
 const shortChart = LightweightCharts.createChart($("#short-chart"), {...COMMON, height:140});
 // 밴드는 회계 기준 시계열이라 다른 패널과 시간축을 공유하지 않는다
 const bandChart = LightweightCharts.createChart($("#band-chart"), {...COMMON, height:200});
+
+// 밴드 위에 마우스를 올리면 그 시점 값 + 평균 대비 위치를 띄운다.
+// (기존엔 오른쪽 축 라벨만 있어서 특정 시점 값을 읽을 수 없었다)
+let BAND_STATS = null;   // renderBand 가 채운다: {mean, sd, unit}
+bandChart.subscribeCrosshairMove(p => {
+  const tip = $("#band-tip"), box = $("#band-chart");
+  if (!p || !p.time || !p.point || p.point.x < 0 || p.point.y < 0){
+    tip.style.display = "none"; return;
+  }
+  // 1순위: 크로스헤어가 넘겨준 시리즈 값
+  let val = null;
+  const v = p.seriesData && p.seriesData.get(bandLine);
+  if (v != null) val = (typeof v === "object") ? v.value : v;
+  // 2순위: 시간으로 원본에서 직접 찾기 (seriesData 가 비는 경우 대비)
+  if (val == null){
+    const d = BAND_CACHE[(CUR_TICKER||"") + "|" + BAND_B];
+    const arr = d && d.available && d.series[BAND_M];
+    if (arr){
+      const hit = arr.find(x => x[0] === p.time);
+      if (hit) val = hit[1];
+    }
+  }
+  if (val == null){ tip.style.display = "none"; return; }
+
+  const s = BAND_STATS || {};
+  const z = (s.sd ? (val - s.mean) / s.sd : null);
+  const zc = z == null ? "var(--muted)" : (z > 1 ? "#f87171" : (z < -1 ? "#4ade80" : "#8b98a9"));
+  tip.innerHTML =
+    `<div><b>${p.time}</b></div>` +
+    `<div><span class="k">${BAND_M}</span><b>${val.toFixed(2)}${s.unit || ""}</b></div>` +
+    (s.mean != null ? `<div><span class="k">평균</span>${s.mean.toFixed(2)}` +
+      (z != null ? ` <b style="color:${zc}">(${z >= 0 ? "+" : ""}${z.toFixed(1)}σ)</b>` : "") + `</div>` : "");
+
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = p.point.x + 14, y = p.point.y - h - 10;
+  if (x + w > box.clientWidth) x = p.point.x - w - 14;   // 오른쪽 끝에서 뒤집기
+  if (y < 0) y = p.point.y + 14;
+  tip.style.left = Math.max(0, x) + "px";
+  tip.style.top = Math.max(0, y) + "px";
+});
 const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart, flowChart, shortChart];
 
 // 시리즈
@@ -587,6 +635,8 @@ function renderBand(){
       fwdTxt = ` · <span style="color:#4ade80">FWD ${r0.period} ${r0[BAND_M].toFixed(2)} (${fz>=0?'+':''}${fz.toFixed(1)}σ)</span>`;
     } else bandFwd.setData([]);
   } else bandFwd.setData([]);
+
+  BAND_STATS = {mean, sd, unit: (BAND_M === "ROE" ? "%" : "배")};   // 툴팁용
 
   const cur = vals[vals.length-1];
   const z = sd ? (cur-mean)/sd : 0;

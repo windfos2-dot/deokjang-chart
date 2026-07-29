@@ -336,12 +336,17 @@ def get_forward_estimates(ticker):
     except Exception:  # noqa: BLE001
         pass
     if mktcap_eok is None:
-        # 폴백: KRX 오픈API 월말 시총 (pykrx 웹로그인과 별개 인증이라 잠금 무관)
+        # 폴백: 최근 종가 × DART 발행주식수.
+        # (이전엔 KRX 월말시총 캐시의 마지막 값을 썼는데, 부분 수집으로 캐시가
+        #  오염되면 몇 년 전 시총을 현재값으로 쓰는 사고가 났다 — 삼양식품 실측)
         try:
-            caps = get_monthly_mktcap().get(ticker)
-            if caps:
-                mktcap_eok = caps[-1][1] / 1e8
-                cap_src = "KRX오픈API"
+            shares = get_shares_dart(ticker, years=3)
+            o = get_ohlcv(ticker, days=10)
+            if shares and o["close"]:
+                n = _shares_at(shares, o["dates"][-1])
+                if n:
+                    mktcap_eok = o["close"][-1] * n / 1e8
+                    cap_src = "종가×DART주식수"
         except Exception:  # noqa: BLE001
             pass
     if mktcap_eok is None:
@@ -611,6 +616,67 @@ def get_monthly_mktcap(years=15, workers=10):
         return data
 
 
+def get_shares_dart(ticker, years=15):
+    """DART 주식총수현황 -> {연도: 발행주식총수}.
+
+    시가총액을 KRX 에서 날짜별로 긁는 대신 '종가 × 주식수' 로 만들기 위한 것.
+    KRX 오픈API 는 날짜당 1콜이라 15년치면 수천 콜이고, 실제로 IP 차단까지 갔다.
+    DART 는 종목당 연 1콜이면 되고 별도 서버라 KRX 상태와 무관하다.
+    유상증자·액면분할로 주식수가 변하므로 연도별로 받아 구간 적용한다.
+    """
+    key = ("shares", ticker, years)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    import build_static as bs
+    dkey = bs._dart_key()
+    corp = bs.dart_corp_map().get(ticker)
+    if not dkey or not corp:
+        return {}
+
+    this_year = datetime.now().year
+    yrs = list(range(this_year - years, this_year + 1))
+
+    def fetch(y):
+        try:
+            r = requests.get(f"{bs.DART_BASE}/stockTotqySttus.json",
+                             params={"crtfc_key": dkey, "corp_code": corp,
+                                     "bsns_year": y, "reprt_code": "11011"},
+                             timeout=25)
+            rows = r.json().get("list") or []
+        except Exception:  # noqa: BLE001
+            return y, None
+        for it in rows:
+            if (it.get("se") or "").strip() in ("합계", "보통주"):
+                try:
+                    n = float(str(it.get("istc_totqy", "")).replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    return y, n
+        return y, None
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for y, n in ex.map(fetch, yrs):
+            if n:
+                out[y] = n
+    _ttl_set(key, out)
+    return out
+
+
+def _shares_at(shares_by_year, date_str):
+    """해당 시점에 유효한 주식수 (그 연도 값, 없으면 가장 가까운 과거 연도)."""
+    if not shares_by_year:
+        return None
+    y = int(date_str[:4])
+    for yy in range(y, min(shares_by_year) - 1, -1):
+        if yy in shares_by_year:
+            return shares_by_year[yy]
+    return shares_by_year[min(shares_by_year)]
+
+
 def _reported_fy(date_str):
     """그 시점에 공시되어 있었을 회계연도.
     FY Y 사업보고서는 이듬해 3월경 제출되므로 4월 이후라야 FY(Y-1)을 쓴다.
@@ -652,10 +718,6 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
     if cached is not None:
         return cached
 
-    caps = get_monthly_mktcap(years).get(ticker)
-    if not caps:
-        return {"available": False, "reason": "월말 시가총액 없음"}
-
     import build_static as bs                     # DART 수집 재사용
     fin = bs.dart_financials([ticker], years=years).get(ticker)
     if not fin:
@@ -667,28 +729,23 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
         if not ltm:
             return {"available": False, "reason": "LTM 산출 불가(분기 데이터 부족)"}
 
-    # --- 일별 시가총액 ---
+    # --- 일별 시가총액 = 종가 × 발행주식수(DART, 연도별) ---
+    # KRX 를 날짜별로 긁지 않는다(호출 1회 = OHLCV, 주식수는 DART).
+    shares_by_year = get_shares_dart(ticker, years=years)
+    if not shares_by_year:
+        return {"available": False, "reason": "발행주식수 없음(DART)"}
+    try:
+        o = get_ohlcv(ticker, days=int(years * 252))
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"OHLCV 실패: {e}"}
+
     points = []                                    # [(date, mktcap)]
-    if daily:
-        try:
-            o = get_ohlcv(ticker, days=int(years * 252))
-            closes = dict(zip(o["dates"], o["close"]))
-            # 월말 시총/종가 -> 그 시점의 주식수
-            shares = []
-            for d, cap in caps:
-                c = closes.get(d)
-                if c:
-                    shares.append((d, cap / c))
-            if shares:
-                si = 0
-                for d in o["dates"]:
-                    while si + 1 < len(shares) and shares[si + 1][0] <= d:
-                        si += 1
-                    points.append((d, closes[d] * shares[si][1]))
-        except Exception:  # noqa: BLE001
-            points = []
+    for d, c in zip(o["dates"], o["close"]):
+        n = _shares_at(shares_by_year, d)
+        if n and c:
+            points.append((d, c * n))
     if not points:
-        points = [(d, c) for d, c in caps]          # 폴백: 월말만
+        return {"available": False, "reason": "시가총액 산출 불가"}
 
     series = {"PER": [], "PBR": [], "POR": [], "ROE": []}
     li = 0
@@ -741,7 +798,8 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
 
     out = {"available": True, "ticker": ticker,
            "basis": basis,
-           "resolution": "daily" if daily and len(points) > len(caps) else "monthly",
+           "resolution": "daily",
+           "mktcap_source": "종가 × DART 발행주식수",
            "series": series, "forward": forward,
            "fin": {str(y): v for y, v in sorted(fin.items())},
            "note": "FY 실적은 이듬해 3월경 공시 -> 4월부터 반영(선행편향 제거)"}
