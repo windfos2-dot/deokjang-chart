@@ -52,6 +52,13 @@
                  background:var(--panel);border:1px solid var(--border);
                  padding:4px 9px;border-radius:6px}
   #empty{padding:60px 20px;text-align:center;color:var(--muted)}
+  .tfgroup{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+  .tf{background:var(--panel);color:var(--muted);border:0;padding:5px 12px;
+      font-size:12px;cursor:pointer;font-family:inherit}
+  .tf + .tf{border-left:1px solid var(--border)}
+  .tf.on{background:var(--accent);color:#06231f;font-weight:600}
+  .tf:hover:not(.on){background:#1b2432;color:var(--text)}
+  #tfnote{color:#f5c77e;font-size:11px;padding:0 14px 4px}
   footer{padding:14px;color:var(--muted);font-size:11px;text-align:center;
          border-top:1px solid var(--border)}
 </style>
@@ -69,6 +76,9 @@
 </header>
 
 <div class="toolbar">
+  <span class="tfgroup">
+    <button class="tf on" data-tf="D">일봉</button><button class="tf" data-tf="W">주봉</button><button class="tf" data-tf="M">월봉</button>
+  </span>
   <label><input type="checkbox" id="t-ma" checked> 이동평균</label>
   <label><input type="checkbox" id="t-bb" checked> 볼린저(20,2)</label>
   <label><input type="checkbox" id="t-hma" checked> HMA(60)</label>
@@ -78,6 +88,7 @@
   <label><input type="checkbox" id="t-ob"> 오더블록</label>
   <label><input type="checkbox" id="t-div" checked> RSI 다이버전스</label>
 </div>
+<div id="tfnote"></div>
 <div id="mnv"></div>
 
 <main>
@@ -100,7 +111,41 @@
 const $ = s => document.querySelector(s);
 const pairs = (d, a) => d.map((t,i)=> (a && a[i]!=null) ? {time:t, value:a[i]} : null).filter(Boolean);
 
-let INDEX = [], CUR = null;
+let INDEX = [], CUR = null, TF = "D";   // D=일봉 W=주봉 M=월봉
+
+// 일봉 -> 주/월봉 재집계. 주차는 ISO 기준(연도+월중주차로 하면 1월·2월 1주가 섞인다).
+function isoWeekKey(s){
+  const d = new Date(s + "T00:00:00Z");
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7));          // 목요일 기준
+  const y0 = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+  const wk = Math.ceil((((t - y0) / 86400000) + 1) / 7);
+  return `${t.getUTCFullYear()}-W${String(wk).padStart(2,"0")}`;
+}
+
+function resample(d, tf){
+  if (tf === "D") return d;
+  const keyOf = tf === "W" ? isoWeekKey : (s => s.slice(0,7));
+  const buckets = new Map();
+  for (let i = 0; i < d.dates.length; i++){
+    const k = keyOf(d.dates[i]);
+    const b = buckets.get(k);
+    if (!b){
+      buckets.set(k, {date:d.dates[i], o:d.o[i], h:d.h[i], l:d.l[i], c:d.c[i], v:d.v[i]});
+    } else {
+      b.h = Math.max(b.h, d.h[i]);
+      b.l = Math.min(b.l, d.l[i]);
+      b.c = d.c[i];                    // 시간순이므로 마지막이 종가
+      b.v += d.v[i];
+      b.date = d.dates[i];             // 라벨은 구간 마지막 거래일
+    }
+  }
+  const rows = [...buckets.values()];
+  return {...d, dates:rows.map(r=>r.date), o:rows.map(r=>r.o), h:rows.map(r=>r.h),
+          l:rows.map(r=>r.l), c:rows.map(r=>r.c), v:rows.map(r=>r.v),
+          _resampled:true};
+}
+
 const COMMON = {
   // 패널이 display:none 인 상태에서 생성되면 폭이 300px 로 고정된다.
   // autoSize 는 ResizeObserver 로 컨테이너 크기를 따라간다.
@@ -185,7 +230,16 @@ async function load(region, ticker){
   render(d);
 }
 
-function render(d){
+function render(src){
+  // 주/월봉은 일봉을 브라우저에서 재집계한다.
+  // ⚠️ 서버가 계산해 넣은 패턴/오더블록/S-R돌파/다이버전스는 '일봉 인덱스' 기준이라
+  //    재집계하면 봉 위치가 어긋난다. 그래서 일봉에서만 표시한다.
+  const d = resample(src, TF);
+  const daily = TF === "D";
+  $("#tfnote").textContent = daily ? "" :
+    `${TF==="W"?"주":"월"}봉에서는 패턴·오더블록·S/R 돌파·다이버전스를 숨깁니다 ` +
+    `(서버 계산값이 일봉 기준이라 봉 위치가 어긋납니다). 이동평균·볼린저·RSI 등은 재집계 기준으로 다시 계산됩니다.`;
+
   const A = DJIndicators.computeArrays(d);     // 배열 지표는 브라우저에서 계산
   const dates = d.dates;
 
@@ -195,15 +249,19 @@ function render(d){
   hmaS.setData(pairs(dates,A.ma.hma60));
   ichA.setData(pairs(dates,A.ichimoku.span_a)); ichB.setData(pairs(dates,A.ichimoku.span_b));
   ichT.setData(pairs(dates,A.ichimoku.tenkan)); ichK.setData(pairs(dates,A.ichimoku.kijun));
-  srHi.setData(pairs(dates,d.sr?.resistance)); srLo.setData(pairs(dates,d.sr?.support));
+  srHi.setData(daily ? pairs(dates,d.sr?.resistance) : []);
+  srLo.setData(daily ? pairs(dates,d.sr?.support) : []);
 
   volSeries.setData(dates.map((t,i)=>({time:t, value:d.v[i],
     color: d.c[i]>=d.o[i] ? "rgba(226,68,92,.5)":"rgba(59,130,246,.5)"})));
   rsiSeries.setData(pairs(dates,A.rsi));
-  sqzSeries.setData(dates.map((t,i)=> d.squeeze.val[i]==null?null:
-    ({time:t, value:d.squeeze.val[i], color:d.squeeze.color[i]})).filter(Boolean));
+  // 스퀴즈 계열도 서버 계산값이라 일봉에서만 (재집계 시 봉 수가 달라진다)
+  const sqzData = daily ? dates.map((t,i)=> d.squeeze.val[i]==null?null:
+    ({time:t, value:d.squeeze.val[i], color:d.squeeze.color[i]})).filter(Boolean) : [];
+  sqzSeries.setData(sqzData);
 
-  const aa = d.squeeze_aa||{};
+  const aa = daily ? (d.squeeze_aa||{}) : {};
+  if(!daily){ aaVf.setData([]); aaZ.setData([]); $("#aa-note").textContent = "일봉 전용"; }
   if(aa.vf){
     aaVf.setData(dates.map((t,i)=> aa.vf[i]==null?null:
       ({time:t, value:aa.vf[i], color: aa.vf[i]>0?"#00ffbb":"#ff1100"})).filter(Boolean));
@@ -213,14 +271,14 @@ function render(d){
 
   // 패턴선 + 오더블록
   clearDynamic();
-  if($("#t-pat").checked) (d.patterns||[]).forEach(p=>{
+  if(daily && $("#t-pat").checked) (d.patterns||[]).forEach(p=>{
     [["upper","#f0b90b"],["lower","#38bdf8"]].forEach(([k,c])=>{
       const s = mkLine({color:c, lineWidth:2, lineStyle:2});
       s.setData([{time:dates[p[k].x1],value:p[k].y1},{time:dates[p[k].x2],value:p[k].y2}]);
       dynamic.push(s);
     });
   });
-  if($("#t-ob").checked){
+  if(daily && $("#t-ob").checked){
     const ob = d.order_blocks||{bull:[],bear:[]};
     [...(ob.bull||[]),...(ob.bear||[])].forEach(b=>{
       const end = Math.min(dates.length-1, b.index+20);
@@ -232,14 +290,14 @@ function render(d){
       });
     });
   }
-  $("#patlist").innerHTML = ($("#t-pat").checked? (d.patterns||[]):[]).map(p=>
+  $("#patlist").innerHTML = (daily && $("#t-pat").checked ? (d.patterns||[]):[]).map(p=>
     `<span class="crit">${p.name} ${dates[p.start]}~${dates[p.end]}</span>`).join(" ");
 
-  // 마커
+  // 마커 (일봉 인덱스 기준이므로 일봉에서만)
   let marks=[];
-  if($("#t-div").checked) marks = marks.concat((d.rsi_bear_div||[]).map(i=>
+  if(daily && $("#t-div").checked) marks = marks.concat((d.rsi_bear_div||[]).map(i=>
     ({time:dates[i],position:"aboveBar",color:"#e2445c",shape:"arrowDown",text:"Bear"})));
-  if($("#t-sr").checked) marks = marks.concat((d.sr?.breaks||[]).map(b=>{
+  if(daily && $("#t-sr").checked) marks = marks.concat((d.sr?.breaks||[]).map(b=>{
     const up = b.type==="break_up"||b.type==="bull_wick";
     return {time:dates[b.index],position:up?"belowBar":"aboveBar",
             color:up?"#22c55e":"#e2445c",shape:up?"arrowUp":"arrowDown",text:b.label||"B"};
@@ -280,6 +338,13 @@ function applyToggles(){
 }
 document.querySelectorAll(".toolbar input").forEach(cb=>
   cb.addEventListener("change", ()=>{ if(CUR) render(CUR); }));
+
+document.querySelectorAll(".tf").forEach(btn=>
+  btn.addEventListener("click", ()=>{
+    document.querySelectorAll(".tf").forEach(b=>b.classList.toggle("on", b===btn));
+    TF = btn.dataset.tf;
+    if(CUR) render(CUR);
+  }));
 
 addEventListener("resize", ()=>{
   mainChart.applyOptions({width:$("#main-chart").clientWidth});
