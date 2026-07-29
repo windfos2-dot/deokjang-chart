@@ -42,7 +42,7 @@ _HTML_PATH = os.path.join(_BASE_DIR, "static", "chart_live.html")
 # 상태
 # ---------------------------------------------------------------------------
 @router.get("/mtf")
-def mtf(ticker: str = Query(..., min_length=6, max_length=6)):
+def mtf(ticker: str = Query(..., min_length=1, max_length=12)):
     """멀티타임프레임 신호 (5분 / 60분 / 일봉).
 
     분봉은 KIS 전용이라 KIS 미설정이면 일봉만 반환한다.
@@ -114,7 +114,7 @@ def mtf(ticker: str = Query(..., min_length=6, max_length=6)):
 
 
 @router.get("/intraday")
-def intraday(ticker: str = Query(..., min_length=6, max_length=6),
+def intraday(ticker: str = Query(..., min_length=1, max_length=12),
              tf: int = Query(5, ge=1, le=240),
              bars: int = Query(120, ge=10, le=400)):
     """N분봉 OHLCV (KIS 전용)."""
@@ -126,7 +126,7 @@ def intraday(ticker: str = Query(..., min_length=6, max_length=6),
 
 
 @router.get("/bands")
-def bands(ticker: str = Query(..., min_length=6, max_length=6),
+def bands(ticker: str = Query(..., min_length=1, max_length=12),
           years: int = Query(15, ge=1, le=20),
           basis: str = Query("FY", pattern="^(FY|LTM)$")):
     """역사적 밸류에이션 밴드 (PER/PBR/POR/ROE).
@@ -140,7 +140,7 @@ def bands(ticker: str = Query(..., min_length=6, max_length=6),
 
 
 @router.get("/signals")
-def signals(ticker: str = Query(..., min_length=6, max_length=6),
+def signals(ticker: str = Query(..., min_length=1, max_length=12),
             basis: str = Query("LTM", pattern="^(FY|LTM)$")):
     """신호등 — 일/주/월봉 각각의 추세(Minervini) + 밸류에이션 위치.
 
@@ -271,7 +271,7 @@ def search(q: str = Query(..., min_length=1), limit: int = Query(20, ge=1, le=10
 # OHLCV
 # ---------------------------------------------------------------------------
 @router.get("/ohlcv")
-def ohlcv(ticker: str = Query(..., min_length=6, max_length=6),
+def ohlcv(ticker: str = Query(..., min_length=1, max_length=12),
           days: int = Query(280, ge=30, le=2000)):
     try:
         return loader.get_ohlcv(ticker, days=days)
@@ -283,7 +283,7 @@ def ohlcv(ticker: str = Query(..., min_length=6, max_length=6),
 # 전체 (프론트 메인)
 # ---------------------------------------------------------------------------
 @router.get("/full")
-def full(ticker: str = Query(..., min_length=6, max_length=6),
+def full(ticker: str = Query(..., min_length=1, max_length=12),
          days: int = Query(280, ge=30, le=6000),
          tf: str = Query("D", pattern="^[DWM]$"),
          sr_vol_thresh: float = Query(20.0, ge=-100.0, le=500.0)):

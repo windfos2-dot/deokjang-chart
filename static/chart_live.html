@@ -42,23 +42,23 @@
   .chg.up{color:var(--up)} .chg.down{color:var(--down)}
   #banner{display:none;padding:8px 18px;background:#3b2a12;color:#f5c77e;
           font-size:12.5px;border-bottom:1px solid #5a4320}
-  main{padding:10px 14px 40px; margin-right:330px}
+  main{padding:10px 14px 40px; margin-right:372px}
   @media (max-width:1100px){ main{margin-right:0} #side{position:static;width:auto;height:auto} }
-  #side{position:fixed; right:0; top:0; width:320px; height:100vh; overflow-y:auto;
+  #side{position:fixed; right:0; top:0; width:360px; height:100vh; overflow-y:auto;
         background:var(--panel); border-left:1px solid var(--border); padding:12px;
         z-index:40; font-size:12px}
   #side h3{font-size:12.5px;margin:0 0 8px;color:var(--text);font-weight:600;
            display:flex;justify-content:space-between;align-items:center;gap:6px}
   #side .sub{color:var(--muted);font-size:11px;font-weight:400}
   #est-table{width:100%;border-collapse:collapse;font-size:11px}
-  #est-table th,#est-table td{padding:4px 5px;text-align:right;border-bottom:1px solid #1b2432;
+  #est-table th,#est-table td{padding:6px 8px;text-align:right;border-bottom:1px solid #1b2432;
                               white-space:nowrap}
   #est-table th{color:var(--muted);font-weight:500}
   #est-table td:first-child,#est-table th:first-child{text-align:left}
   #est-table tr.est{background:rgba(45,212,191,.07)}
   #est-table tr.est td:first-child{color:var(--accent);font-weight:600}
   #mtf-table{width:100%;border-collapse:collapse;font-size:11px}
-  #mtf-table th,#mtf-table td{padding:5px;text-align:right;border-bottom:1px solid #1b2432;white-space:nowrap}
+  #mtf-table th,#mtf-table td{padding:7px 9px;text-align:right;border-bottom:1px solid #1b2432;white-space:nowrap}
   #mtf-table th{color:var(--muted);font-weight:500}
   #mtf-table td:first-child,#mtf-table th:first-child{text-align:left;font-weight:600}
   .vd{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10.5px;font-weight:600}
@@ -72,7 +72,7 @@
   .tfb.on,.pdb.on,.bm.on,.bb.on,.by.on{background:var(--accent);color:#06231f;font-weight:600}
   .tfb:hover:not(.on),.pdb:hover:not(.on),.bm:hover:not(.on),.bb:hover:not(.on),.by:hover:not(.on){background:#1b2432;color:var(--text)}
   #sig-table{width:100%;border-collapse:collapse;font-size:11px}
-  #sig-table td,#sig-table th{padding:4px 5px;border-bottom:1px solid #1b2432;white-space:nowrap}
+  #sig-table td,#sig-table th{padding:7px 10px;border-bottom:1px solid #1b2432;white-space:nowrap}
   #sig-table th{color:var(--muted);font-weight:500;text-align:right}
   #sig-table td:first-child,#sig-table th:first-child{text-align:left;font-weight:600}
   #sig-table td:not(:first-child){text-align:right}
@@ -85,7 +85,11 @@
   .lamp.green{background:#22c55e;box-shadow:0 0 6px #22c55e88}
   .lamp.yellow{background:#facc15;box-shadow:0 0 6px #facc1588}
   .lamp.red{background:#f87171;box-shadow:0 0 6px #f8717188}
-  .sechead{color:var(--muted);font-size:10.5px;margin:8px 0 3px}
+  .sechead{color:var(--muted);font-size:10.5px;margin:12px 0 5px;
+         letter-spacing:.2px;font-weight:600}
+  #sig-table td:last-child,#sig-table th:last-child{width:26px;text-align:center}
+  #sig-table{table-layout:auto}
+  #side h3{margin:0 0 10px}
   .up{color:#f87171} .dn{color:#60a5fa}
   .op{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600}
   .op.buy{background:#0f3f33;color:#4ade80} .op.hold{background:#3a3320;color:#f0c674}
@@ -559,7 +563,10 @@ function render(d){
   const chg = prev ? ((last-prev)/prev*100) : 0;
   $("#meta").innerHTML =
     `<b>${d.name ?? ""}</b> <span class="mk">${d.ticker ?? ""} · ${d.market ?? ""}</span>` +
-    `<span>${Number(last).toLocaleString()}원</span>` +
+    // 미국 종목은 달러로 표기 (원화로 찍히던 문제)
+    `<span>${d.market === "US"
+        ? "$" + Number(last).toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2})
+        : Number(last).toLocaleString() + "원"}</span>` +
     `<span class="chg ${chg>=0?"up":"down"}">${chg>=0?"+":""}${chg.toFixed(2)}%</span>` +
     `<span class="mk">${o.dates[0]} ~ ${o.dates[o.dates.length-1]} (${o.dates.length}봉)</span>`;
 

@@ -718,22 +718,31 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
     if cached is not None:
         return cached
 
-    import build_static as bs                     # DART 수집 재사용
-    fin = bs.dart_financials([ticker], years=years).get(ticker)
-    if not fin:
-        return {"available": False, "reason": "DART 재무 없음(비상장/신규상장 등)"}
-
+    us = is_us_ticker(ticker)
     ltm = None
-    if basis == "LTM":
-        ltm = _ltm_timeline(bs.dart_quarterly(ticker, years=years))
-        if not ltm:
-            return {"available": False, "reason": "LTM 산출 불가(분기 데이터 부족)"}
+    if us:
+        # 미국은 SEC XBRL (DART 는 국내 전용)
+        fin = sec_financials(ticker, years=years)
+        if not fin:
+            return {"available": False, "reason": "SEC 재무 없음(비상장/ETF 등)"}
+        shares_by_year = sec_shares(ticker)
+        src = "SEC EDGAR"
+    else:
+        import build_static as bs                 # DART 수집 재사용
+        fin = bs.dart_financials([ticker], years=years).get(ticker)
+        if not fin:
+            return {"available": False, "reason": "DART 재무 없음(비상장/신규상장 등)"}
+        if basis == "LTM":
+            ltm = _ltm_timeline(bs.dart_quarterly(ticker, years=years))
+            if not ltm:
+                return {"available": False, "reason": "LTM 산출 불가(분기 데이터 부족)"}
+        shares_by_year = get_shares_dart(ticker, years=years)
+        src = "DART"
 
-    # --- 일별 시가총액 = 종가 × 발행주식수(DART, 연도별) ---
-    # KRX 를 날짜별로 긁지 않는다(호출 1회 = OHLCV, 주식수는 DART).
-    shares_by_year = get_shares_dart(ticker, years=years)
+    # --- 일별 시가총액 = 종가 × 발행주식수(연도별) ---
+    # 시장별로 소스가 다르다: 한국=DART, 미국=SEC. 둘 다 종목당 소수 콜이면 끝.
     if not shares_by_year:
-        return {"available": False, "reason": "발행주식수 없음(DART)"}
+        return {"available": False, "reason": f"발행주식수 없음({src})"}
     try:
         o = get_ohlcv(ticker, days=int(years * 252))
     except Exception as e:  # noqa: BLE001
@@ -750,7 +759,7 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
     series = {"PER": [], "PBR": [], "POR": [], "ROE": []}
     li = 0
     for date, cap in points:
-        if basis == "LTM":
+        if basis == "LTM" and ltm:
             while li + 1 < len(ltm) and ltm[li + 1][0] <= date:
                 li += 1
             if ltm[li][0] > date:               # 아직 4개 분기가 안 쌓임
@@ -799,7 +808,8 @@ def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
     out = {"available": True, "ticker": ticker,
            "basis": basis,
            "resolution": "daily",
-           "mktcap_source": "종가 × DART 발행주식수",
+           "mktcap_source": f"종가 × {src} 발행주식수",
+           "fin_source": src,
            "series": series, "forward": forward,
            "fin": {str(y): v for y, v in sorted(fin.items())},
            "note": "FY 실적은 이듬해 3월경 공시 -> 4월부터 반영(선행편향 제거)"}
@@ -944,6 +954,276 @@ def _load_universe():
         return uni
 
 
+# ---------------------------------------------------------------------------
+# 미국장 (yfinance)
+# ---------------------------------------------------------------------------
+# 티커 형태로 시장을 판별한다: 6자리 숫자면 한국, 알파벳이면 미국.
+_US_UNI_FILE = os.path.join(_CACHE_DIR, "us_universe.json")
+_us_uni_cache = {"data": None, "built": 0.0}
+
+
+def is_us_ticker(t):
+    t = (t or "").strip()
+    return bool(t) and t.replace(".", "").replace("-", "").isalpha()
+
+
+def load_us_universe():
+    """NASDAQ Trader 공개 목록 (무료·키 불필요). 하루 캐시."""
+    now = time.time()
+    if _us_uni_cache["data"] and now - _us_uni_cache["built"] < 86400:
+        return _us_uni_cache["data"]
+    try:
+        st = os.path.getmtime(_US_UNI_FILE)
+        if now - st < 86400:
+            with open(_US_UNI_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            _us_uni_cache.update({"data": data, "built": now})
+            return data
+    except (OSError, ValueError):
+        pass
+
+    out = {}
+    for url in ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+                "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"):
+        try:
+            r = requests.get(url, timeout=40, headers=_UA)
+            lines = r.text.splitlines()
+        except Exception:  # noqa: BLE001
+            continue
+        if not lines:
+            continue
+        head = lines[0].split("|")
+        try:
+            si = head.index("Symbol") if "Symbol" in head else head.index("ACT Symbol")
+            ni = head.index("Security Name")
+        except ValueError:
+            continue
+        ei = head.index("ETF") if "ETF" in head else None
+        ti = head.index("Test Issue") if "Test Issue" in head else None
+        for line in lines[1:]:
+            p = line.split("|")
+            if len(p) <= max(si, ni) or "File Creation" in line:
+                continue
+            sym = p[si].strip()
+            if not sym or not sym.isalpha():
+                continue
+            if ei is not None and len(p) > ei and p[ei].strip() == "Y":
+                continue
+            if ti is not None and len(p) > ti and p[ti].strip() == "Y":
+                continue
+            out[sym] = p[ni].strip()[:70]
+    if out:
+        _us_uni_cache.update({"data": out, "built": now})
+        try:
+            with open(_US_UNI_FILE, "w", encoding="utf-8") as f:
+                json.dump(out, f)
+        except OSError:
+            pass
+    return out
+
+
+def get_ohlcv_us(ticker, days=750):
+    """미국 종목 OHLCV (yfinance). KRX·DART 와 무관."""
+    key = ("ohlcv_us", ticker, days)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+    import yfinance as yf
+    # ⚠️ period="max" 는 레이트리밋에 자주 걸린다(실측: max 실패, 10y 정상).
+    #    10y 를 상한으로 두고, 실패 시 더 짧은 기간으로 단계적 폴백.
+    order = [p for p in ("10y", "5y", "2y", "1y")
+             if p != "10y" or days > 1300]
+    if days <= 600:
+        order = ["2y", "1y"]
+    elif days <= 1300:
+        order = ["5y", "2y", "1y"]
+    df = None
+    for period in order:
+        try:
+            df = yf.download(ticker, period=period, interval="1d", progress=False,
+                             auto_adjust=True, threads=False)
+        except Exception:  # noqa: BLE001
+            df = None
+        if df is not None and not df.empty:
+            break
+        time.sleep(0.6)
+    if df is None or df.empty:
+        raise ValueError(f"OHLCV 데이터 없음(US): {ticker} — yfinance 레이트리밋 가능")
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna().tail(days)
+    out = {
+        "ticker": ticker,
+        "name": load_us_universe().get(ticker, ticker),
+        "market": "US",
+        "dates": [d.strftime("%Y-%m-%d") for d in df.index],
+        "open": df["Open"].astype(float).tolist(),
+        "high": df["High"].astype(float).tolist(),
+        "low": df["Low"].astype(float).tolist(),
+        "close": df["Close"].astype(float).tolist(),
+        "volume": df["Volume"].astype(float).tolist(),
+    }
+    _ttl_set(key, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SEC EDGAR — 미국 재무 (밸류에이션 밴드용)
+# ---------------------------------------------------------------------------
+# DART 가 국내 전용이므로 미국은 SEC XBRL 을 쓴다. 무료·키 불필요.
+# SEC 는 User-Agent 에 연락처를 요구한다(없으면 403).
+# SEC 는 User-Agent 에 '실제 연락 이메일'을 요구한다. 없으면 403 Forbidden.
+# (실측: "deokjang-chart/1.0 (contact via github)" -> 403)
+_SEC_UA = {
+    "User-Agent": os.getenv(
+        "SEC_UA", f"deokjang-chart/1.0 ({os.getenv('SEC_EMAIL', 'windfos2@gmail.com')})"),
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "www.sec.gov",
+}
+
+
+def _sec_headers(host):
+    h = dict(_SEC_UA)
+    h["Host"] = host
+    return h
+_SEC_CIK_FILE = os.path.join(_CACHE_DIR, "sec_cik.json")
+_sec_cik_cache = {"data": None, "built": 0.0}
+
+# 계정과목은 회사마다 태그가 달라 후보를 순서대로 시도한다.
+_SEC_CONCEPTS = {
+    "rev": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+    "op":  ["OperatingIncomeLoss"],
+    "ni":  ["NetIncomeLoss", "ProfitLoss"],
+    "eq":  ["StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+}
+
+
+def _sec_get(url, timeout=30):
+    from urllib.parse import urlparse
+    r = requests.get(url, headers=_sec_headers(urlparse(url).netloc), timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def sec_cik_map():
+    """{ticker: CIK(10자리)}. 하루 캐시."""
+    now = time.time()
+    if _sec_cik_cache["data"] and now - _sec_cik_cache["built"] < 86400:
+        return _sec_cik_cache["data"]
+    try:
+        if now - os.path.getmtime(_SEC_CIK_FILE) < 86400:
+            with open(_SEC_CIK_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            _sec_cik_cache.update({"data": data, "built": now})
+            return data
+    except (OSError, ValueError):
+        pass
+    try:
+        raw = _sec_get("https://www.sec.gov/files/company_tickers.json")
+    except Exception as e:  # noqa: BLE001
+        print(f"[SEC] CIK 매핑 실패: {e}")
+        return {}
+    data = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in raw.values()}
+    _sec_cik_cache.update({"data": data, "built": now})
+    try:
+        with open(_SEC_CIK_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+    return data
+
+
+def sec_financials(ticker, years=15):
+    """SEC XBRL 연간 재무 -> {회계연도: {rev, op, ni, eq}}.
+
+    ⚠️ SEC 응답에는 같은 회계연도가 여러 번 나온다(원공시 + 이후 보고서의 비교표시).
+       fy 필드는 '그 값이 실린 보고서의 연도'라 재무연도와 다를 수 있으므로,
+       기간 종료일(end)의 연도를 기준으로 삼고 가장 늦게 제출된 값을 채택한다.
+    """
+    key = ("secfin", ticker, years)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    cik = sec_cik_map().get(ticker.upper())
+    if not cik:
+        return {}
+
+    out = defaultdict(dict)
+
+    def pull(field, tags):
+        for tag in tags:
+            try:
+                d = _sec_get(f"https://data.sec.gov/api/xbrl/companyconcept/"
+                             f"CIK{cik}/us-gaap/{tag}.json")
+            except Exception:  # noqa: BLE001
+                continue
+            best = {}
+            for u in (d.get("units", {}).get("USD") or []):
+                if u.get("form") not in ("10-K", "20-F"):
+                    continue
+                end = u.get("end", "")
+                if len(end) < 4:
+                    continue
+                # 손익은 연간(약 1년) 구간만, 자본은 시점값이라 start 가 없다
+                if field != "eq":
+                    st = u.get("start")
+                    if not st:
+                        continue
+                    try:
+                        dur = (datetime.strptime(end, "%Y-%m-%d")
+                               - datetime.strptime(st, "%Y-%m-%d")).days
+                    except ValueError:
+                        continue
+                    if not (330 <= dur <= 400):
+                        continue
+                y = int(end[:4])
+                filed = u.get("filed", "")
+                if y not in best or filed >= best[y][0]:
+                    best[y] = (filed, u["val"])
+            if best:
+                for y, (_f, v) in best.items():
+                    out[y][field] = float(v)
+                return
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(lambda kv: pull(*kv), _SEC_CONCEPTS.items()))
+
+    this_year = datetime.now().year
+    res = {y: v for y, v in out.items() if this_year - years <= y <= this_year}
+    _ttl_set(key, res)
+    return res
+
+
+def sec_shares(ticker):
+    """발행주식수 (SEC). 시가총액 = 종가 × 주식수 계산용."""
+    cik = sec_cik_map().get(ticker.upper())
+    if not cik:
+        return {}
+    for tag in ("CommonStockSharesOutstanding", "CommonStockSharesIssued",
+                "WeightedAverageNumberOfDilutedSharesOutstanding"):
+        try:
+            d = _sec_get(f"https://data.sec.gov/api/xbrl/companyconcept/"
+                         f"CIK{cik}/us-gaap/{tag}.json")
+        except Exception:  # noqa: BLE001
+            continue
+        best = {}
+        for unit in d.get("units", {}).values():
+            for u in unit:
+                end = u.get("end", "")
+                if len(end) < 4 or u.get("form") not in ("10-K", "10-Q", "20-F"):
+                    continue
+                y = int(end[:4])
+                filed = u.get("filed", "")
+                if y not in best or filed >= best[y][0]:
+                    best[y] = (filed, float(u["val"]))
+        if best:
+            return {y: v for y, (_f, v) in best.items()}
+    return {}
+
+
 def search_ticker(q, limit=20):
     """종목명/코드 부분일치 검색. -> [{code, name, market}]."""
     q = (q or "").strip()
@@ -977,6 +1257,26 @@ def search_ticker(q, limit=20):
         return 2
 
     results.sort(key=_rank)
+
+    # 미국 종목도 같은 검색창에서 찾게 한다 (티커 또는 회사명)
+    if len(results) < limit:
+        try:
+            us = load_us_universe()
+            qu = q.upper()
+            hits = []
+            if qu in us:
+                hits.append({"code": qu, "name": us[qu], "market": "US"})
+            for sym, nm in us.items():
+                if sym == qu:
+                    continue
+                if sym.startswith(qu) or q_lower in nm.lower():
+                    hits.append({"code": sym, "name": nm, "market": "US"})
+                if len(hits) >= limit - len(results):
+                    break
+            results += hits
+        except Exception:  # noqa: BLE001
+            pass
+
     return results[:limit]
 
 
@@ -1000,6 +1300,9 @@ def get_market_of(ticker):
 # ---------------------------------------------------------------------------
 def get_ohlcv(ticker, days=280):
     """OHLCV -> dict(dates, open, high, low, close, volume). 수정주가 기준."""
+    if is_us_ticker(ticker):          # 미국 종목은 yfinance 경로
+        return get_ohlcv_us(ticker, days=days)
+
     key = ("ohlcv", ticker, days)
     cached = _ttl_get(key)
     if cached is not None:
