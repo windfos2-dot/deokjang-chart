@@ -341,14 +341,27 @@ sqzSeries.createPriceLine({price:0, color:"#5d6d7e", lineWidth:1, lineStyle:0, a
 flowSeries.createPriceLine({price:0, color:"#5d6d7e", lineWidth:1, lineStyle:0, axisLabelVisible:false});
 
 // 시간축 동기화
+// CHARTS 는 봉 수가 같으므로 논리 인덱스로 묶는다.
 let syncing = false;
 CHARTS.forEach((c) => {
   c.timeScale().subscribeVisibleLogicalRangeChange((range) => {
     if (syncing || !range) return;
     syncing = true;
     CHARTS.forEach((o) => { if (o !== c) o.timeScale().setVisibleLogicalRange(range); });
+    // 밴드는 봉 수가 다르므로(가격 750봉 vs 밴드 2,500여봉) 논리 인덱스로 맞추면
+    // 엉뚱한 구간이 뜬다. '시간' 기준으로 따로 맞춘다.
+    const t = c.timeScale().getVisibleRange();
+    if (t) { try { bandChart.timeScale().setVisibleRange(t); } catch(e){} }
     syncing = false;
   });
+});
+
+// 밴드에서 스크롤/줌 하면 가격 차트들도 같은 기간으로 맞춘다 (양방향)
+bandChart.timeScale().subscribeVisibleTimeRangeChange((t) => {
+  if (syncing || !t) return;
+  syncing = true;
+  CHARTS.forEach((o) => { try { o.timeScale().setVisibleRange(t); } catch(e){} });
+  syncing = false;
 });
 
 window.addEventListener("resize", () => {
@@ -643,7 +656,13 @@ function renderBand(){
   const pct = vals.filter(v=>v<=cur).length/vals.length*100;
   note.innerHTML = `${d.basis} · 현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · 평균 ${mean.toFixed(2)} · ` +
     `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt;
-  requestAnimationFrame(()=>bandChart.timeScale().fitContent());
+  // 렌더 직후 fitContent 로 전체(최대 15년)를 펼치면 가격 차트와 구간이 어긋난다.
+  // 메인 차트가 보고 있는 기간에 맞춘다(없을 때만 전체 보기).
+  requestAnimationFrame(()=>{
+    const t = mainChart.timeScale().getVisibleRange();
+    if (t) { try { bandChart.timeScale().setVisibleRange(t); return; } catch(e){} }
+    bandChart.timeScale().fitContent();
+  });
 }
 
 document.querySelectorAll(".bm").forEach(b=>b.addEventListener("click",()=>{
