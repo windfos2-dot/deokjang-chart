@@ -191,9 +191,6 @@
         <span class="btngroup" style="margin-left:6px">
           <button class="bb on" data-b="FY">FY확정</button><button class="bb" data-b="LTM">LTM</button>
         </span>
-        <span class="btngroup" style="margin-left:6px">
-          <button class="by" data-y="1">1년</button><button class="by" data-y="3">3년</button><button class="by on" data-y="5">5년</button><button class="by" data-y="10">10년</button>
-        </span>
       </span>
       <span id="band-note" class="mk"></span>
     </div>
@@ -594,7 +591,7 @@ function render(d){
 }
 
 // ---- 밸류에이션 밴드 ----
-let BAND_M = "PER", BAND_B = "FY", BAND_Y = 5, BAND_CACHE = {};
+let BAND_M = "PER", BAND_B = "FY", BAND_CACHE = {};   // 기간은 상단 버튼(PERIOD)을 따른다
 const bandLine = bandChart.addLineSeries({color:"#38bdf8", lineWidth:2, priceLineVisible:false});
 const bandRefs = ["#f0b90b","#8b97a8","#8b97a8","#5d6d7e","#5d6d7e"].map((c,i)=>
   bandChart.addLineSeries({color:c, lineWidth:1, lineStyle:i===0?0:(i<3?2:3),
@@ -623,8 +620,16 @@ function renderBand(){
 
   let pts = (d.series[BAND_M]||[]).map(x=>({time:x[0], value:x[1]}));
   if(!pts.length){ clear(); note.textContent = `${BAND_M} 산출 불가 (적자 등)`; return; }
-  // 일별이므로 1년 ≈ 252봉
-  pts = pts.slice(-BAND_Y*252);
+
+  // 기간은 상단 버튼(가격 차트)을 그대로 따른다.
+  // 밴드에 별도 기간 버튼을 두고 표시구간만 맞추려 했더니 데이터 길이가 달라
+  // 동기화가 어긋났다. 아예 같은 날짜 구간으로 잘라 두면 구조적으로 맞는다.
+  const pd = LAST && LAST.ohlcv && LAST.ohlcv.dates;
+  if (pd && pd.length){
+    const from = pd[0], to = pd[pd.length-1];
+    const cut = pts.filter(p => p.time >= from && p.time <= to);
+    if (cut.length >= 2) pts = cut;
+  }
   bandLine.setData(pts);
 
   const vals = pts.map(p=>p.value);
@@ -653,21 +658,13 @@ function renderBand(){
   const pct = vals.filter(v=>v<=cur).length/vals.length*100;
   note.innerHTML = `${d.basis} · 현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · 평균 ${mean.toFixed(2)} · ` +
     `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt;
-  // 렌더 직후 fitContent 로 전체(최대 15년)를 펼치면 가격 차트와 구간이 어긋난다.
-  // 메인 차트가 보고 있는 기간에 맞춘다(없을 때만 전체 보기).
-  requestAnimationFrame(()=>{
-    const t = mainChart.timeScale().getVisibleRange();
-    if (t) { try { bandChart.timeScale().setVisibleRange(t); return; } catch(e){} }
-    bandChart.timeScale().fitContent();
-  });
+  // 데이터를 이미 가격 차트와 같은 날짜 구간으로 잘랐으므로 fitContent 면 겹친다.
+  requestAnimationFrame(()=>bandChart.timeScale().fitContent());
 }
 
 document.querySelectorAll(".bm").forEach(b=>b.addEventListener("click",()=>{
   document.querySelectorAll(".bm").forEach(x=>x.classList.toggle("on",x===b));
   BAND_M=b.dataset.m; renderBand(); }));
-document.querySelectorAll(".by").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".by").forEach(x=>x.classList.toggle("on",x===b));
-  BAND_Y=+b.dataset.y; renderBand(); }));
 document.querySelectorAll(".bb").forEach(b=>b.addEventListener("click",()=>{
   document.querySelectorAll(".bb").forEach(x=>x.classList.toggle("on",x===b));
   BAND_B=b.dataset.b; if(CUR_TICKER) loadBands(CUR_TICKER); }));
@@ -833,7 +830,7 @@ document.querySelectorAll(".tfb").forEach(b=>b.addEventListener("click",()=>{
 }));
 document.querySelectorAll(".pdb").forEach(b=>b.addEventListener("click",()=>{
   document.querySelectorAll(".pdb").forEach(x=>x.classList.toggle("on",x===b));
-  PERIOD=+b.dataset.d; if(CUR_TICKER) loadTicker(CUR_TICKER);
+  PERIOD=+b.dataset.d; if(CUR_TICKER) loadTicker(CUR_TICKER);   // 밴드도 같은 구간으로 다시 그려진다
 }));
 
 // ---- 검색 (디바운스) ----
