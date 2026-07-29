@@ -1,0 +1,201 @@
+"""
+export_chart.py — 종목 차트를 '파일 하나'로 내보낸다.
+
+로컬 서버(chart_router)에서 데이터를 받아 HTML 안에 통째로 박아 넣는다.
+받은 사람은 서버도 파이썬도 필요 없고, 파일을 더블클릭하면 차트가 뜬다.
+(차트 라이브러리만 CDN 에서 받으므로 볼 때 인터넷은 필요하다)
+
+사용:
+    python export_chart.py 005930
+    python export_chart.py NVDA --days 1250 --out ~/Desktop/nvda.html
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+API = os.getenv("CHART_API", "http://127.0.0.1:8010")
+
+
+def fetch(path, **params):
+    url = f"{API}/api/chart/{path}?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=180) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+TEMPLATE = """<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+ :root{--bg:#0d1117;--panel:#131a24;--border:#243040;--text:#e6edf3;--muted:#8b98a9;--accent:#2dd4bf}
+ *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);
+   font:13px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
+ header{padding:12px 16px;border-bottom:1px solid var(--border);background:var(--panel);
+   display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+ h1{font-size:15px;margin:0} .mk{color:var(--muted);font-size:12px}
+ .up{color:#e2445c} .dn{color:#3b82f6}
+ main{padding:10px 14px 30px}
+ .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+   margin-bottom:10px;overflow:hidden}
+ .ptitle{font-size:11.5px;color:var(--muted);padding:7px 12px;
+   border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}
+ .tag{display:inline-block;background:#1b2432;border:1px solid var(--border);border-radius:5px;
+   padding:2px 7px;margin:3px 4px 0 0;font-size:11px;color:#c9d4e2}
+ .badge{display:inline-block;border-radius:5px;padding:2px 8px;font-weight:600;font-size:11.5px}
+ .ok{background:#0f3f33;color:#4ade80} .no{background:#3f1620;color:#fb7185}
+ table{width:100%;border-collapse:collapse;font-size:11.5px}
+ th,td{padding:7px 10px;border-bottom:1px solid #1b2432;text-align:right;white-space:nowrap}
+ th{color:var(--muted);font-weight:500} td:first-child,th:first-child{text-align:left;font-weight:600}
+ .lamp{display:inline-block;width:11px;height:11px;border-radius:50%}
+ .g{background:#22c55e}.y{background:#facc15}.r{background:#f87171}
+ footer{padding:14px;text-align:center;color:var(--muted);font-size:11px;
+   border-top:1px solid var(--border)}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+ @media(max-width:760px){.grid{grid-template-columns:1fr}}
+</style></head><body>
+<header>
+  <h1>__NAME__</h1>
+  <span class="mk">__TICKER__ · __MARKET__</span>
+  <b>__LAST__</b><span class="__CHGC__">__CHG__</span>
+  <span class="mk">__RANGE__</span>
+</header>
+<main>
+  <div class="panel"><div class="ptitle"><span>가격 · 이동평균 · 볼린저</span><span id="mnv"></span></div>
+    <div id="c1" style="height:380px"></div><div id="pats" style="padding:6px 10px"></div></div>
+  <div class="panel"><div class="ptitle"><span id="bt">밸류에이션 밴드</span><span id="bn"></span></div>
+    <div id="c2" style="height:190px"></div></div>
+  <div class="grid">
+    <div class="panel"><div class="ptitle"><span>RSI(14)</span></div><div id="c3" style="height:150px"></div></div>
+    <div class="panel"><div class="ptitle"><span>신호등 · 밸류</span></div><div id="sig" style="padding:4px 0"></div></div>
+  </div>
+</main>
+<footer>덕장 차트 · 내보낸 시각 __NOW__ · 투자 판단의 근거로 쓰지 마세요</footer>
+<script>
+const D = __DATA__;
+const C={layout:{background:{color:"transparent"},textColor:"#8b98a9",fontSize:11},
+ grid:{vertLines:{color:"#151b26"},horzLines:{color:"#151b26"}},
+ rightPriceScale:{borderColor:"#243040"},timeScale:{borderColor:"#243040"},autoSize:true};
+const c1=LightweightCharts.createChart(document.getElementById("c1"),{...C,height:380});
+const c2=LightweightCharts.createChart(document.getElementById("c2"),{...C,height:190});
+const c3=LightweightCharts.createChart(document.getElementById("c3"),{...C,height:150});
+const o=D.full.ohlcv, ind=D.full.indicators, dt=o.dates;
+const pair=(a)=>dt.map((t,i)=>a&&a[i]!=null?{time:t,value:a[i]}:null).filter(Boolean);
+
+c1.addCandlestickSeries({upColor:"#e2445c",downColor:"#3b82f6",borderUpColor:"#e2445c",
+ borderDownColor:"#3b82f6",wickUpColor:"#e2445c",wickDownColor:"#3b82f6"})
+ .setData(dt.map((t,i)=>({time:t,open:o.open[i],high:o.high[i],low:o.low[i],close:o.close[i]})));
+[["sma20","#f0b90b"],["sma50","#a78bfa"],["sma120","#2dd4bf"]].forEach(([k,c])=>
+ c1.addLineSeries({color:c,lineWidth:1,priceLineVisible:false,lastValueVisible:false}).setData(pair(ind[k])));
+["bb_upper","bb_lower"].forEach(k=>
+ c1.addLineSeries({color:"#8b98a9",lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false}).setData(pair(ind[k])));
+c3.addLineSeries({color:"#e6edf3",lineWidth:1}).setData(pair(ind.rsi));
+[70,30].forEach(v=>c3.addLineSeries({color:"#3a4658",lineWidth:1,lineStyle:2,lastValueVisible:false})
+ .setData([{time:dt[0],value:v},{time:dt[dt.length-1],value:v}]));
+
+document.getElementById("pats").innerHTML=(ind.patterns||[]).map(p=>
+ `<span class="tag">${p.name} ${dt[p.start]}~${dt[p.end]}</span>`).join(" ");
+const mv=ind.minervini&&ind.minervini.latest;
+if(mv) document.getElementById("mnv").innerHTML=
+ `<span class="badge ${mv.pass?"ok":"no"}">Minervini ${mv.pass?"통과":"미충족"}</span>`;
+
+// 밸류에이션 밴드
+const B=D.bands;
+if(B&&B.available){
+  const M="PER", arr=(B.series[M]||[]).filter(x=>x[0]>=dt[0]&&x[0]<=dt[dt.length-1]);
+  if(arr.length){
+    c2.addLineSeries({color:"#38bdf8",lineWidth:2}).setData(arr.map(x=>({time:x[0],value:x[1]})));
+    const v=arr.map(x=>x[1]), m=v.reduce((a,b)=>a+b,0)/v.length;
+    const sd=Math.sqrt(v.reduce((a,b)=>a+(b-m)**2,0)/v.length);
+    [[m,"#f0b90b",0],[m+sd,"#8b98a9",2],[m-sd,"#8b98a9",2]].forEach(([lv,c,st])=>
+      c2.addLineSeries({color:c,lineWidth:1,lineStyle:st,lastValueVisible:false})
+        .setData([{time:arr[0][0],value:lv},{time:arr[arr.length-1][0],value:lv}]));
+    const cur=v[v.length-1], z=sd?(cur-m)/sd:0;
+    document.getElementById("bt").textContent=`밸류에이션 밴드 · ${M} (${B.basis})`;
+    document.getElementById("bn").innerHTML=
+      `현재 <b>${cur.toFixed(2)}</b> · 평균 ${m.toFixed(2)} · ${z>=0?"+":""}${z.toFixed(1)}σ`;
+  }
+} else document.getElementById("bn").textContent=(B&&B.reason)||"데이터 없음";
+
+// 신호등
+const S=D.signals||{}, L={green:"g",yellow:"y",red:"r"};
+let html="<table><tr><th>TF</th><th>조건</th><th></th></tr>";
+(S.frames||[]).forEach(f=>{ html += f.available
+ ? `<tr><td>${f.tf}</td><td>${f.passed}/${f.total}</td><td><span class="lamp ${L[f.light]}"></span></td></tr>`
+ : `<tr><td>${f.tf}</td><td colspan=2 class="mk">${(f.reason||"").slice(0,18)}</td></tr>`;});
+html+="</table>";
+const m2=(S.valuation&&S.valuation.metrics)||{};
+if(Object.keys(m2).length){
+  html+="<table><tr><th>지표</th><th>현재</th><th>편차</th><th></th></tr>";
+  for(const k in m2){const x=m2[k];
+    html+=`<tr><td>${k}</td><td>${x.current.toFixed(2)}</td><td>${x.z>=0?"+":""}${x.z.toFixed(1)}σ</td>`
+        + `<td><span class="lamp ${L[x.light]}"></span></td></tr>`;}
+  html+="</table>";
+}
+document.getElementById("sig").innerHTML=html;
+requestAnimationFrame(()=>[c1,c2,c3].forEach(c=>c.timeScale().fitContent()));
+</script></body></html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ticker")
+    ap.add_argument("--days", type=int, default=750)
+    ap.add_argument("--tf", default="D", choices=["D", "W", "M"])
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+    t = a.ticker.strip().upper() if a.ticker.strip().isalpha() else a.ticker.strip()
+
+    print(f"[1/3] 시세·지표 …", flush=True)
+    full = fetch("full", ticker=t, days=a.days, tf=a.tf)
+    print(f"[2/3] 밸류에이션 밴드 …", flush=True)
+    try:
+        bands = fetch("bands", ticker=t)
+    except Exception as e:  # noqa: BLE001
+        bands = {"available": False, "reason": str(e)}
+    print(f"[3/3] 신호등 …", flush=True)
+    try:
+        signals = fetch("signals", ticker=t)
+    except Exception as e:  # noqa: BLE001
+        signals = {"frames": [], "valuation": {"error": str(e)}}
+
+    o = full["ohlcv"]
+    last = o["close"][-1]
+    prev = o["close"][-2] if len(o["close"]) > 1 else last
+    chg = (last / prev - 1) * 100 if prev else 0.0
+    us = full.get("market") == "US"
+    name = full.get("name") or t
+
+    html = (TEMPLATE
+            .replace("__TITLE__", f"{name} 차트")
+            .replace("__NAME__", name)
+            .replace("__TICKER__", t)
+            .replace("__MARKET__", full.get("market") or "")
+            .replace("__LAST__", (f"${last:,.2f}" if us else f"{last:,.0f}원"))
+            .replace("__CHG__", f"{chg:+.2f}%")
+            .replace("__CHGC__", "up" if chg >= 0 else "dn")
+            .replace("__RANGE__", f"{o['dates'][0]} ~ {o['dates'][-1]} ({len(o['dates'])}봉)")
+            .replace("__NOW__", datetime.now().strftime("%Y-%m-%d %H:%M"))
+            .replace("__DATA__", json.dumps({"full": full, "bands": bands,
+                                             "signals": signals},
+                                            ensure_ascii=False, separators=(",", ":"))))
+
+    out = a.out or os.path.join(os.path.expanduser("~/Desktop"),
+                                f"덕장차트_{name}_{datetime.now():%Y%m%d}.html")
+    out = os.path.expanduser(out)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"\n✅ 저장: {out}  ({os.path.getsize(out)/1024:.0f}KB)")
+    print("   파일을 더블클릭하면 차트가 열립니다 (서버·파이썬 불필요).")
+
+
+if __name__ == "__main__":
+    main()
