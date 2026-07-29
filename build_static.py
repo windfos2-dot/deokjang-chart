@@ -43,15 +43,15 @@ DOCS = os.path.join(ROOT, "docs")
 DATA = os.path.join(DOCS, "data")
 
 KRX_BASE = "https://data-dbg.krx.co.kr/svc/apis"
-BARS = 280                    # 일봉 수 (MA200 계산에 여유)
+BARS = 750                    # 일봉 수 (약 3년). MA200 계산에도 여유
 SUPPLY_TOP = 300              # 수급/공매도를 붙일 한국 시총 상위 N
 
 # --- 장기 시계열 (밸류에이션 밴드 · 주/월봉용) ---
 # 일봉을 10년치 다 담으면 종목당 용량이 9배가 되므로, 최근 구간만 일봉으로 두고
 # 장기는 주봉/월봉으로 압축해 저장한다. 밴드는 월말 시가총액이면 충분하다.
-LONG_YEARS = 10
-WEEK_BARS = 520               # 10년 주봉
-MONTH_BARS = 120              # 10년 월봉
+LONG_YEARS = 15               # KRX 오픈API 는 2010년부터 제공
+WEEK_BARS = 780               # 15년 주봉
+MONTH_BARS = 180              # 15년 월봉
 MIN_MKTCAP = 1e11             # 시총 하한 (1,000억) — 이하 종목은 제외
 
 
@@ -346,7 +346,7 @@ def us_collect(symbols, batch=200, keep=None):
     for i in range(0, len(syms), batch):
         chunk = syms[i:i + batch]
         try:
-            df = yf.download(chunk, period="18mo", interval="1d", progress=False,
+            df = yf.download(chunk, period="15y", interval="1d", progress=False,
                              auto_adjust=True, threads=True, group_by="column")
         except Exception as e:  # noqa: BLE001
             log(f"[US] 배치 실패 {i}: {e}")
@@ -469,8 +469,18 @@ def kr_collect_long(key, min_cap=MIN_MKTCAP, years=LONG_YEARS, workers=12):
         if len(ds_sorted) < 60:
             continue
         name, mkt, cap = universe[code]
+        # 일봉도 여기서 만든다. 별도로 kr_collect 를 또 돌리면 같은 날짜를
+        # 두 번 받는 셈이라 868콜이 낭비된다.
+        recent_ds = ds_sorted[-BARS:]
+        daily = {"dates": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+        for ds in recent_ds:
+            o, h, l, c, v, _cap = bydate[ds]
+            daily["dates"].append(f"{ds[:4]}-{ds[4:6]}-{ds[6:]}")
+            daily["open"].append(o); daily["high"].append(h)
+            daily["low"].append(l); daily["close"].append(c); daily["volume"].append(v)
         out[code] = {
             "name": name, "market": mkt, "cap": cap,
+            "daily": daily,
             "weekly": _agg(bydate, ds_sorted, "W")[-WEEK_BARS:],
             "monthly": _agg(bydate, ds_sorted, "M")[-MONTH_BARS:],
         }
@@ -618,6 +628,82 @@ def dart_financials(tickers, years=LONG_YEARS, workers=6):
     return out
 
 
+def dart_quarterly(ticker, years=LONG_YEARS, workers=6):
+    """분기 재무 -> LTM(최근 4분기 합) 산출용 타임라인.
+
+    ⚠️ 필드 의미 (실측 확인):
+        분기/반기 보고서 thstrm_amount     = 해당 3개월 (이미 분기값, 차분 불필요)
+        분기/반기 보고서 thstrm_add_amount = 누적
+        사업보고서      thstrm_amount     = 연간 (add 없음)
+      -> Q1~Q3 는 그대로 쓰고, Q4 만 '연간 − 3분기누적' 으로 구한다.
+      검산(삼성전자 2025): 79.1+74.6=153.7(반기누적), +86.1=239.8(3Q누적),
+                          333.6−239.8=93.8(Q4)
+
+    손익(rev/op/ni)은 분기 차분 후 4개를 더해 LTM 을 만들고,
+    자본총계(eq)는 저량(stock)이므로 해당 시점 값을 그대로 쓴다.
+
+    반환: [{"avail": "YYYY-MM-DD", "y":연, "q":분기, "rev","op","ni","eq"}, ...]
+          avail = 그 보고서가 공시되어 '알 수 있었던' 시점 (선행편향 제거용)
+    """
+    key = _dart_key()
+    if not key:
+        return []
+    cmap = dart_corp_map()
+    corp = cmap.get(ticker)
+    if not corp:
+        return []
+
+    this_year = datetime.now().year
+    yrs = list(range(this_year - years, this_year + 1))
+    reports = [("11013", 1), ("11012", 2), ("11014", 3), ("11011", 4)]
+
+    def fetch(args):
+        yr, (rc, q) = args
+        url = (f"{DART_BASE}/fnlttSinglAcnt.json?crtfc_key={key}"
+               f"&corp_code={corp}&bsns_year={yr}&reprt_code={rc}")
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                return yr, q, json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return yr, q, {}
+
+    jobs = [(yr, rq) for yr in yrs for rq in reports]
+    raw = {}                     # (year, q) -> {"amt":{...}, "cum":{...}}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for yr, q, d in ex.map(fetch, jobs):
+            for it in (d.get("list") or []):
+                fld = _DART_WANT.get(it.get("account_nm"))
+                if not fld:
+                    continue
+                slot = raw.setdefault((yr, q), {"amt": {}, "cum": {}})
+                prefer = it.get("fs_div") == "CFS"
+                for src, bucket in (("thstrm_amount", "amt"),
+                                    ("thstrm_add_amount", "cum")):
+                    try:
+                        val = float(str(it.get(src, "")).replace(",", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if prefer or fld not in slot[bucket]:
+                        slot[bucket][fld] = val
+
+    quarters = []
+    for (yr, q) in sorted(raw):
+        cur = raw[(yr, q)]
+        row = {"y": yr, "q": q, "eq": cur["amt"].get("eq")}
+        for f in ("rev", "op", "ni"):
+            if q < 4:
+                row[f] = cur["amt"].get(f)              # 이미 3개월치
+            else:
+                annual = cur["amt"].get(f)
+                q3 = raw.get((yr, 3), {}).get("cum", {}).get(f)
+                row[f] = (annual - q3) if (annual is not None and q3 is not None) else None
+        # 공시 시점 (분기·반기는 분기말+45일, 사업보고서는 이듬해 3월말)
+        row["avail"] = {1: f"{yr}-05-16", 2: f"{yr}-08-15",
+                        3: f"{yr}-11-15", 4: f"{yr+1}-04-01"}[q]
+        quarters.append(row)
+    return quarters
+
+
 # ---------------------------------------------------------------------------
 # 지수
 # ---------------------------------------------------------------------------
@@ -675,7 +761,7 @@ def collect_indices():
     try:
         import yfinance as yf
         syms = [s for s, _ in WORLD_INDICES]
-        df = yf.download(syms, period="18mo", interval="1d", progress=False,
+        df = yf.download(syms, period="15y", interval="1d", progress=False,
                          auto_adjust=False, threads=True)
         for sym, name in WORLD_INDICES:
             try:
@@ -795,7 +881,16 @@ def main():
     # ---- 한국 ----
     if not args.skip_kr:
         key = _krx_key()
-        if key:
+        long_map = {}
+        if key and not args.skip_long:
+            # 장기 수집이 일봉까지 만들어 주므로 별도 수집을 생략한다.
+            long_map = kr_collect_long(key, min_cap=args.min_cap or MIN_MKTCAP)
+            items = sorted(((c, v["name"], v["market"], v["cap"])
+                            for c, v in long_map.items()), key=lambda x: -x[3])
+            series = {c: v["daily"] for c, v in long_map.items()}
+            if args.kr_limit:
+                items = items[:args.kr_limit]
+        elif key:
             items, series = kr_collect(key, args.kr_limit)
         else:
             log("[KR] KRX_API_KEY 없음 -> pykrx 폴백(KRX 웹 로그인) 사용")
@@ -806,13 +901,8 @@ def main():
             items = [it for it in items if it[3] >= args.min_cap]
             log(f"[KR] 시총 {args.min_cap/1e8:,.0f}억 필터: {before} -> {len(items)}종목")
 
-        # 장기 시계열(주/월봉) + DART 재무 — 밸류에이션 밴드용
-        long_map, fin_map = {}, {}
-        if items and not args.skip_long:
-            if key:
-                long_map = kr_collect_long(key, min_cap=args.min_cap or MIN_MKTCAP)
-            else:
-                log("[LONG] KRX_API_KEY 없음 -> 장기 시계열 생략")
+        # DART 재무 — 밸류에이션 밴드용 (장기 시계열은 위에서 이미 확보)
+        fin_map = {}
         if items and not args.skip_dart:
             fin_map = dart_financials([it[0] for it in items])
 

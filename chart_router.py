@@ -125,6 +125,116 @@ def intraday(ticker: str = Query(..., min_length=6, max_length=6),
     return {"ticker": ticker, "tf_minutes": tf, "bars": data}
 
 
+@router.get("/bands")
+def bands(ticker: str = Query(..., min_length=6, max_length=6),
+          years: int = Query(15, ge=1, le=20),
+          basis: str = Query("FY", pattern="^(FY|LTM)$")):
+    """역사적 밸류에이션 밴드 (PER/PBR/POR/ROE).
+
+    월말 시가총액 시계열 × DART 연간 재무로 산출한다.
+    """
+    try:
+        return loader.get_valuation_bands(ticker, years=years, basis=basis)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"밴드 조회 실패: {e}") from e
+
+
+@router.get("/signals")
+def signals(ticker: str = Query(..., min_length=6, max_length=6),
+            basis: str = Query("LTM", pattern="^(FY|LTM)$")):
+    """신호등 — 일/주/월봉 각각의 추세(Minervini) + 밸류에이션 위치.
+
+    추세등: Minervini 추세템플릿 8조건 통과율
+    밸류등: 역사적 PER 밴드에서 현재 위치(z-score). 낮을수록 초록.
+    """
+    out = {"ticker": ticker, "frames": [], "valuation": None}
+
+    # --- 타임프레임별 추세 ---
+    try:
+        o = loader.get_ohlcv(ticker, days=2000)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"OHLCV 실패: {e}") from e
+
+    def _bucket(key_fn):
+        b, order = {}, []
+        for i, dt in enumerate(o["dates"]):
+            k = key_fn(dt)
+            if k not in b:
+                b[k] = {"h": o["high"][i], "l": o["low"][i], "c": o["close"][i]}
+                order.append(k)
+            else:
+                b[k]["h"] = max(b[k]["h"], o["high"][i])
+                b[k]["l"] = min(b[k]["l"], o["low"][i])
+                b[k]["c"] = o["close"][i]
+        return ([b[k]["h"] for k in order], [b[k]["l"] for k in order],
+                [b[k]["c"] for k in order])
+
+    def _iso_week(d):
+        y, w, _ = date(int(d[:4]), int(d[5:7]), int(d[8:10])).isocalendar()
+        return f"{y}-W{w:02d}"
+
+    # Minervini 템플릿은 일봉 기준 지표다. 주/월봉에 50/150/200 을 그대로 쓰면
+    # MA200 이 200주(4년)·200개월(16년)이 되어 의미가 달라지므로 기간을 환산한다.
+    #   일봉 50/150/200, 1개월=22봉  ->  주봉 10/30/40, 4봉  ->  월봉 3/7/10, 1봉
+    frames = [
+        ("일봉", (o["high"], o["low"], o["close"]), 260, (50, 150, 200, 22)),
+        ("주봉", _bucket(_iso_week), 52, (10, 30, 40, 4)),
+        ("월봉", _bucket(lambda d: d[:7]), 12, (3, 7, 10, 1)),
+    ]
+
+    for label, (h, l, c), lookback, (mf, mm, ms, rb) in frames:
+        try:
+            mv = ind.minervini_trend_template(
+                c, lookback=min(lookback, max(len(c) - 1, 2)),
+                ma_fast=mf, ma_mid=mm, ma_slow=ms, rise_bars=rb)
+            latest = mv.get("latest")
+            if not latest:
+                out["frames"].append({"tf": label, "available": False,
+                                      "reason": f"봉 부족({len(c)}개)"})
+                continue
+            crit = [v for k, v in latest.items() if k.startswith("c") and v is not None]
+            passed = sum(1 for v in crit if v)
+            total = len(crit)
+            ratio = passed / total if total else 0
+            light = "green" if ratio >= 0.75 else ("yellow" if ratio >= 0.5 else "red")
+            out["frames"].append({
+                "tf": label, "available": True, "bars": len(c),
+                "passed": passed, "total": total, "pass_all": bool(latest.get("pass")),
+                "light": light, "criteria": {k: v for k, v in latest.items()
+                                             if k.startswith("c")},
+            })
+        except Exception as e:  # noqa: BLE001
+            out["frames"].append({"tf": label, "available": False, "reason": str(e)})
+
+    # --- 밸류에이션 위치 ---
+    try:
+        b = loader.get_valuation_bands(ticker, basis=basis)
+        if b.get("available"):
+            vs = {}
+            for m, arr in b["series"].items():
+                if len(arr) < 24:
+                    continue
+                vals = [x[1] for x in arr]
+                mean = sum(vals) / len(vals)
+                sd = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+                cur = vals[-1]
+                z = (cur - mean) / sd if sd else 0.0
+                pct = sum(1 for v in vals if v <= cur) / len(vals) * 100
+                # 밸류는 낮을수록 좋다(ROE 는 반대)
+                good_low = m != "ROE"
+                light = ("green" if (z <= -0.5) else "yellow" if z < 1.0 else "red") \
+                    if good_low else \
+                    ("green" if z >= 0.5 else "yellow" if z > -1.0 else "red")
+                vs[m] = {"current": round(cur, 2), "mean": round(mean, 2),
+                         "z": round(z, 2), "pct": round(pct, 1), "light": light}
+            out["valuation"] = {"basis": b.get("basis"), "metrics": vs,
+                                "forward": b.get("forward")}
+    except Exception as e:  # noqa: BLE001
+        out["valuation"] = {"error": str(e)}
+
+    return out
+
+
 @router.get("/health")
 def health():
     """모듈 상태 + KRX 로그인 게이트 상태."""

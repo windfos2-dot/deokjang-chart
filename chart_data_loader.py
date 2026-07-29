@@ -27,6 +27,8 @@ import os
 import re
 import time
 import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import requests
@@ -89,6 +91,8 @@ def _load_dotenv():
     extra = os.getenv("CHART_ENV_FILES", "")
     candidates += [p for p in extra.split(":") if p]
     candidates.append(os.path.join(here, os.pardir, "stock-bot", ".env"))
+    # KRX 오픈API 키(KRX_API_KEY)는 hermes-trade 에 있다. 복사하지 않고 재사용한다.
+    candidates.append(os.path.expanduser("~/hermes-trade/.env"))
 
     for path in candidates:
         _read_env_file(os.path.normpath(path))
@@ -293,13 +297,17 @@ def get_forward_estimates(ticker):
             cap_src = "KRX"
     except Exception:  # noqa: BLE001
         pass
-    if mktcap_eok is None:                      # 폴백: 종가 × 상장주식수
+    if mktcap_eok is None:
+        # 폴백: KRX 오픈API 월말 시총 (pykrx 웹로그인과 별개 인증이라 잠금 무관)
         try:
-            o = get_ohlcv(ticker, days=30)
-            shares = _f(o1.get("capital"))      # capital = 자본금(억), 주식수 아님 → 사용불가
-            raise RuntimeError("상장주식수 미확보")
-        except Exception as e:  # noqa: BLE001
-            return {"available": False, "reason": f"시가총액 조회 실패: {e}"}
+            caps = get_monthly_mktcap().get(ticker)
+            if caps:
+                mktcap_eok = caps[-1][1] / 1e8
+                cap_src = "KRX오픈API"
+        except Exception:  # noqa: BLE001
+            pass
+    if mktcap_eok is None:
+        return {"available": False, "reason": "시가총액 조회 실패"}
 
     # --- 최근 자본총계 (억원) ---
     equity = None
@@ -459,6 +467,248 @@ def get_intraday(ticker, tf_minutes=5, bars=120):
     raw = get_intraday_1m(ticker, need_bars=need_1m)
     agg = resample_bars(raw, tf_minutes) if tf_minutes > 1 else raw
     return agg[-bars:]
+
+
+# ---------------------------------------------------------------------------
+# 역사적 밸류에이션 밴드 (PER / PBR / POR / ROE)
+# ---------------------------------------------------------------------------
+# 월말 시가총액 × DART 연간 재무.
+#   PER = 시총/당기순이익   PBR = 시총/자본총계
+#   POR = 시총/영업이익     ROE = 당기순이익/자본총계
+#
+# KRX 오픈API 는 '날짜 1개 = 전종목' 이라, 월말 180개 날짜를 한 번 받아두면
+# 그 안에 모든 종목의 시총이 들어있다. 그래서 첫 조회만 느리고 이후는 즉시다.
+_KRX_OPENAPI = "https://data-dbg.krx.co.kr/svc/apis"
+_mktcap_cache = {"data": None, "built": 0.0}
+_mktcap_lock = threading.Lock()
+_MKTCAP_TTL = 6 * 3600
+_MKTCAP_FILE = os.path.join(_CACHE_DIR, "monthly_mktcap.json")
+
+
+def _krx_openapi_key():
+    return os.getenv("KRX_API_KEY")
+
+
+def _month_end_dates(years):
+    """최근 N년의 월말(마지막 평일) 날짜 목록."""
+    out = []
+    today = datetime.now()
+    y, m = today.year, today.month
+    for _ in range(years * 12 + 1):
+        # 해당 월의 마지막 날 -> 주말이면 앞으로 당김
+        nm_y, nm_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        d = datetime(nm_y, nm_m, 1) - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        if d <= today:
+            out.append(d.strftime("%Y%m%d"))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    out.reverse()
+    return out
+
+
+def get_monthly_mktcap(years=15, workers=10):
+    """{ticker: [(YYYY-MM-DD, mktcap), ...]} — 전종목 월말 시가총액.
+
+    첫 호출만 네트워크를 타고(약 180콜) 이후엔 메모리/디스크 캐시를 쓴다.
+    """
+    with _mktcap_lock:
+        now = time.time()
+        if _mktcap_cache["data"] and now - _mktcap_cache["built"] < _MKTCAP_TTL:
+            return _mktcap_cache["data"]
+        try:
+            st = os.path.getmtime(_MKTCAP_FILE)
+            if now - st < _MKTCAP_TTL:
+                with open(_MKTCAP_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                _mktcap_cache.update({"data": data, "built": now})
+                return data
+        except (OSError, ValueError):
+            pass
+
+        key = _krx_openapi_key()
+        if not key:
+            raise RuntimeError("KRX_API_KEY 미설정 (밴드는 KRX 오픈API 필요)")
+
+        dates = _month_end_dates(years)
+
+        def fetch(ds):
+            got = []
+            for ep in ("sto/stk_bydd_trd", "sto/ksq_bydd_trd"):
+                try:
+                    r = requests.get(f"{_KRX_OPENAPI}/{ep}", params={"basDd": ds},
+                                     headers={"AUTH_KEY": key}, timeout=30)
+                    d = r.json()
+                    rows = next((v for v in d.values() if isinstance(v, list)), [])
+                    got.extend(rows)
+                except Exception:  # noqa: BLE001
+                    continue
+            return ds, got
+
+        out = defaultdict(list)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for ds, rows in ex.map(fetch, dates):
+                if not rows:
+                    continue
+                label = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
+                for r in rows:
+                    code = r.get("ISU_CD")
+                    if not code:
+                        continue
+                    try:
+                        cap = float(str(r.get("MKTCAP", "0")).replace(",", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if cap > 0:
+                        out[code].append((label, cap))
+        data = {k: sorted(v) for k, v in out.items()}
+        _mktcap_cache.update({"data": data, "built": now})
+        try:
+            with open(_MKTCAP_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+        return data
+
+
+def _reported_fy(date_str):
+    """그 시점에 공시되어 있었을 회계연도.
+    FY Y 사업보고서는 이듬해 3월경 제출되므로 4월 이후라야 FY(Y-1)을 쓴다.
+    (안 그러면 미래 실적으로 과거 PER 을 그리는 선행편향이 생긴다)"""
+    y, m = int(date_str[:4]), int(date_str[5:7])
+    return y - 1 if m >= 4 else y - 2
+
+
+def _ltm_timeline(quarters):
+    """분기 리스트 -> [(공시일, {ni, op, rev, eq}), ...] LTM 누적.
+
+    각 시점에서 '그때까지 공시된' 최근 4개 분기를 합한다(선행편향 제거).
+    자본총계는 저량이라 합산하지 않고 최신값을 쓴다.
+    """
+    rows = sorted((q for q in quarters if q.get("avail")), key=lambda q: q["avail"])
+    out = []
+    for i, q in enumerate(rows):
+        win = rows[max(0, i - 3):i + 1]
+        if len(win) < 4:
+            continue
+        agg = {}
+        for f in ("rev", "op", "ni"):
+            vals = [w[f] for w in win if w.get(f) is not None]
+            agg[f] = sum(vals) if len(vals) == 4 else None
+        agg["eq"] = next((w["eq"] for w in reversed(win) if w.get("eq") is not None), None)
+        out.append((q["avail"], agg))
+    return out
+
+
+def get_valuation_bands(ticker, years=15, daily=True, basis="FY"):
+    """PER/PBR/POR/ROE 시계열 + 포워드 배수.
+
+    일별로 계산한다. 시가총액 = 종가 × 상장주식수인데 주식수는 시간에 따라
+    변하므로(유상증자·분할 등), 월말 시총에서 역산한 주식수를 구간별로 적용한다:
+        shares(월) = 월말시총 / 월말종가
+    """
+    key = ("bands", ticker, years, daily, basis)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    caps = get_monthly_mktcap(years).get(ticker)
+    if not caps:
+        return {"available": False, "reason": "월말 시가총액 없음"}
+
+    import build_static as bs                     # DART 수집 재사용
+    fin = bs.dart_financials([ticker], years=years).get(ticker)
+    if not fin:
+        return {"available": False, "reason": "DART 재무 없음(비상장/신규상장 등)"}
+
+    ltm = None
+    if basis == "LTM":
+        ltm = _ltm_timeline(bs.dart_quarterly(ticker, years=years))
+        if not ltm:
+            return {"available": False, "reason": "LTM 산출 불가(분기 데이터 부족)"}
+
+    # --- 일별 시가총액 ---
+    points = []                                    # [(date, mktcap)]
+    if daily:
+        try:
+            o = get_ohlcv(ticker, days=int(years * 252))
+            closes = dict(zip(o["dates"], o["close"]))
+            # 월말 시총/종가 -> 그 시점의 주식수
+            shares = []
+            for d, cap in caps:
+                c = closes.get(d)
+                if c:
+                    shares.append((d, cap / c))
+            if shares:
+                si = 0
+                for d in o["dates"]:
+                    while si + 1 < len(shares) and shares[si + 1][0] <= d:
+                        si += 1
+                    points.append((d, closes[d] * shares[si][1]))
+        except Exception:  # noqa: BLE001
+            points = []
+    if not points:
+        points = [(d, c) for d, c in caps]          # 폴백: 월말만
+
+    series = {"PER": [], "PBR": [], "POR": [], "ROE": []}
+    li = 0
+    for date, cap in points:
+        if basis == "LTM":
+            while li + 1 < len(ltm) and ltm[li + 1][0] <= date:
+                li += 1
+            if ltm[li][0] > date:               # 아직 4개 분기가 안 쌓임
+                continue
+            fy = ltm[li][1]
+        else:
+            fy = fin.get(_reported_fy(date))
+        if not fy:
+            continue
+        ni, eq, op = fy.get("ni"), fy.get("eq"), fy.get("op")
+        if ni and ni > 0:
+            series["PER"].append([date, round(cap / ni, 2)])
+        if eq and eq > 0:
+            series["PBR"].append([date, round(cap / eq, 3)])
+            if ni:
+                series["ROE"].append([date, round(ni / eq * 100, 2)])
+        if op and op > 0:
+            series["POR"].append([date, round(cap / op, 2)])
+
+    # --- 포워드 배수 (증권사 추정치가 있으면) ---
+    forward = None
+    cur_cap = points[-1][1] if points else None
+    try:
+        est = get_forward_estimates(ticker)
+        if est.get("available") and cur_cap:
+            rows = []
+            for r in est["rows"]:
+                if not r.get("is_estimate"):
+                    continue
+                ni, op, = r.get("net_income"), r.get("op_profit")
+                # DART 는 원, KIS 추정은 억원 -> 억원으로 통일
+                cap_eok = cur_cap / 1e8
+                rows.append({
+                    "period": r["period"],
+                    "PER": round(cap_eok / ni, 2) if ni and ni > 0 else None,
+                    "POR": round(cap_eok / op, 2) if op and op > 0 else None,
+                    "PBR": r.get("pbr"),
+                    "ROE": round(ni / (op or 1) * 0, 2) if False else None,
+                })
+            if rows:
+                forward = {"rows": rows, "opinion": est.get("opinion"),
+                           "est_date": est.get("est_date")}
+    except Exception:  # noqa: BLE001
+        forward = None
+
+    out = {"available": True, "ticker": ticker,
+           "basis": basis,
+           "resolution": "daily" if daily and len(points) > len(caps) else "monthly",
+           "series": series, "forward": forward,
+           "fin": {str(y): v for y, v in sorted(fin.items())},
+           "note": "FY 실적은 이듬해 3월경 공시 -> 4월부터 반영(선행편향 제거)"}
+    _ttl_set(key, out)
+    return out
 
 
 class KrxLoginRequired(RuntimeError):

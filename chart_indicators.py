@@ -1016,7 +1016,8 @@ def ichimoku(high, low, close, tenkan_p=9, kijun_p=26, senkou_b_p=52, disp=26):
 # ---------------------------------------------------------------------------
 # (f) Minervini 추세 템플릿 (52주=260봉 기준)
 # ---------------------------------------------------------------------------
-def minervini_trend_template(close, lookback=260, benchmark_close=None):
+def minervini_trend_template(close, lookback=260, benchmark_close=None,
+                             ma_fast=50, ma_mid=150, ma_slow=200, rise_bars=22):
     """Minervini SEPA 추세 템플릿 8조건.
 
     1) 종가 > MA150 and > MA200
@@ -1032,7 +1033,8 @@ def minervini_trend_template(close, lookback=260, benchmark_close=None):
     """
     close = np.asarray(close, dtype=float)
     L = len(close)
-    ma50, ma150, ma200 = sma(close, 50), sma(close, 150), sma(close, 200)
+    # 주/월봉에 쓸 때는 기간을 환산해 넘긴다(일봉 150/200 ≈ 30/40주 ≈ 7/10개월).
+    ma50, ma150, ma200 = sma(close, ma_fast), sma(close, ma_mid), sma(close, ma_slow)
 
     rs_line = None
     if benchmark_close is not None:
@@ -1053,7 +1055,8 @@ def minervini_trend_template(close, lookback=260, benchmark_close=None):
 
         c1 = bool(close[i] > ma150[i] and close[i] > ma200[i])
         c2 = bool(ma150[i] > ma200[i])
-        c3 = bool(i >= 22 and not np.isnan(ma200[i - 22]) and ma200[i] > ma200[i - 22])
+        c3 = bool(i >= rise_bars and not np.isnan(ma200[i - rise_bars])
+                  and ma200[i] > ma200[i - rise_bars])
         c4 = bool(ma50[i] > ma150[i] and ma50[i] > ma200[i])
         c5 = bool(close[i] > ma50[i])
         c6 = bool(lo52 > 0 and close[i] >= lo52 * 1.30)
