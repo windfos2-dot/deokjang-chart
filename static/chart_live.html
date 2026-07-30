@@ -348,17 +348,32 @@ sqzSeries.createPriceLine({price:0, color:"#5d6d7e", lineWidth:1, lineStyle:0, a
 flowSeries.createPriceLine({price:0, color:"#5d6d7e", lineWidth:1, lineStyle:0, axisLabelVisible:false});
 
 // 시간축 동기화
-// CHARTS 는 봉 수가 같으므로 논리 인덱스로 묶는다.
+// SYNC_LOGICAL 은 가격 차트와 봉 수가 같아 논리 인덱스로 묶어도 안전하다.
+// SYNC_TIME 은 봉 수가 다르므로 반드시 '시간' 기준으로 맞춘다.
+//   - 밴드: 최대 15년치를 받아둔다(가격 1250봉 vs 밴드 2500여봉)
+//   - 공매도: KRX 가 약 2년만 준다(가격 1250봉 vs 공매도 440봉)
+// ⚠️ 봉 수가 다른 차트에 setVisibleLogicalRange 를 걸면 인덱스 0~1250 을 440봉
+//    차트에 강제해 데이터가 한쪽으로 쏠린다. 5년/10년 차트에서 공매도 패널이
+//    깨져 보인 원인이 이것이었다.
+// 전 패널을 '시간' 기준으로 묶는다. 논리 인덱스(봉 번호)로 묶으면 안 된다 —
+// 패널마다 시리즈 길이가 다르기 때문이다(실측 005930, 5년):
+//   가격/거래량 1250봉 · 공매도 440봉(KRX 2년 한도)
+//   RSI·스퀴즈·AlgoAlpha 는 워밍업 구간이 빠져 시작 인덱스가 14·38·29봉씩 밀린다
+// 그래서 인덱스 0~1250 을 그대로 넘기면 짧은 패널은 데이터가 한쪽으로 쏠리고,
+// 워밍업이 있는 패널은 같은 인덱스가 다른 날짜를 가리켜 조용히 어긋난다.
+// 시간축은 모든 패널의 공통 좌표라 길이가 달라도 정렬이 깨지지 않는다.
+// 발신은 가격 패널(CHARTS)만, 수신은 밴드까지 포함해 단방향으로 둔다.
+// 밴드까지 발신하게 하면 renderBand 의 fitContent 가 가격 차트 구간을 덮어써
+// 서로 구간을 밀어내며 튄다(원래 코드 주석이 경고한 그 문제).
+const SYNC_TARGETS = CHARTS.concat([bandChart]);
 let syncing = false;
 CHARTS.forEach((c) => {
-  c.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-    if (syncing || !range) return;
+  c.timeScale().subscribeVisibleTimeRangeChange((t) => {
+    if (syncing || !t) return;
     syncing = true;
-    CHARTS.forEach((o) => { if (o !== c) o.timeScale().setVisibleLogicalRange(range); });
-    // 밴드는 봉 수가 다르므로(가격 750봉 vs 밴드 2,500여봉) 논리 인덱스로 맞추면
-    // 엉뚱한 구간이 뜬다. '시간' 기준으로 따로 맞춘다.
-    const t = c.timeScale().getVisibleRange();
-    if (t) { try { bandChart.timeScale().setVisibleRange(t); } catch(e){} }
+    SYNC_TARGETS.forEach((o) => {
+      if (o !== c) { try { o.timeScale().setVisibleRange(t); } catch(e){} }
+    });
     syncing = false;
   });
 });
