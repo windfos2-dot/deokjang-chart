@@ -403,16 +403,26 @@ def get_forward_estimates_fnguide(ticker):
         if nm and nm not in by_name:
             by_name[nm] = row
 
-    n = len(header)
-    periods = [h.get("YYMM", "") + ("E" if (h.get("EP_CHK") or "").strip() == "E" else "")
-               for h in header]
+    # ⚠️ YYMM 이 None 인 자리표시자 열이 섞여 온다(실측: 스팩 466690 의 VAL1 —
+    #    YYMM/EP_CHK/NO_TYP 전부 None). `.get("YYMM", "")` 는 키가 있고 값이
+    #    None 이면 None 을 주므로 None + "E" 로 터진다. or "" 로 눕히고 건너뛴다.
+    # ⚠️ VAL 번호는 헤더 순서를 가정하지 말고 헤더가 알려주는 CD 를 쓴다.
+    cols = [((h.get("YYMM") or "")
+             + ("E" if (h.get("EP_CHK") or "").strip() == "E" else ""),
+             h.get("CD"))
+            for h in header
+            if (h.get("YYMM") or "").strip() and h.get("CD")]
+    if not cols:
+        return {"available": False, "reason": "FnGuide 기간 정보 없음"}
+    periods = [label for label, _ in cols]
+    n = len(cols)
 
     def series(*names):
         """이름 후보를 순서대로 시도해 첫 번째로 존재하는 행을 시계열로 준다."""
         for nm in names:
             row = by_name.get(nm)
             if row:
-                return [_fng_num(row.get(f"VAL{i}")) for i in range(1, n + 1)]
+                return [_fng_num(row.get(cd)) for _, cd in cols]
         return [None] * n
 
     revenue = series("매출액")
@@ -681,10 +691,16 @@ def get_forward_estimates(ticker):
         _ttl_set(key, us)
         return us
 
-    fng = get_forward_estimates_fnguide(ticker)
+    # FnGuide 는 비공식 엔드포인트라 응답 형태가 종목마다 다르다. 파싱에서 터져도
+    # 패널 전체가 죽지 않도록 감싼다(실측: 스팩은 빈 자리표시자 열을 섞어 보낸다).
+    try:
+        fng = get_forward_estimates_fnguide(ticker)
+    except Exception as e:  # noqa: BLE001
+        fng = {"available": False, "reason": f"FnGuide 파싱 실패: {e}"}
     if fng.get("available"):
         _ttl_set(key, fng)
         return fng
+    fng_reason = fng.get("reason") or ""
 
     if not kis_configured():
         return {"available": False, "reason": "KIS_APP_KEY / KIS_APP_SECRET 미설정"}
@@ -744,7 +760,12 @@ def get_forward_estimates(ticker):
         except Exception:  # noqa: BLE001
             pass
     if mktcap_eok is None:
-        return {"available": False, "reason": "시가총액 조회 실패"}
+        # KRX 시총도, DART 발행주식수도 못 구한 상태다. 스팩·리츠·신규상장처럼
+        # 애초에 컨센서스가 없는 종목이 대부분이므로, '조회 실패'로 뭉개지 말고
+        # FnGuide 가 준 이유를 살려 왜 비었는지 알 수 있게 한다.
+        return {"available": False,
+                "reason": (f"컨센서스 없음 — {fng_reason}" if fng_reason
+                           else "시가총액 조회 실패")}
 
     # --- 최근 자본총계 (억원) ---
     equity = None

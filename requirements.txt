@@ -1,3 +1,15 @@
+# 국내 시세·수급 (KRX/네이버)
 pykrx
 numpy
 requests
+
+# 서버 — chart_router.py 가 fastapi 를 import 하고 uvicorn 으로 뜬다.
+# 원래 DEPLOY.md 는 "fastapi/uvicorn 은 기존 EMS 것을 쓴다"는 전제로 이 둘을
+# 빼놨는데, 지금은 단독 실행이 기본이라 없으면 `No module named uvicorn` 으로
+# 막힌다(실측: 새 venv 에서 런처 안내대로 설치한 뒤 기동 실패).
+fastapi
+uvicorn
+
+# 미국 시세 + 애널리스트 컨센서스
+# (chart_data_loader.get_ohlcv_us / get_forward_estimates_us, build_static.us_collect)
+yfinance

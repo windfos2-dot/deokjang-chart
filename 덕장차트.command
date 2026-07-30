@@ -30,10 +30,18 @@ fi
 if [ ! -x ".venv/bin/python" ]; then
   echo "❌ 최초 1회 설치가 필요합니다. 아래를 복사해 터미널에 붙여넣으세요:"
   echo
-  echo "   cd \"$(pwd)\" && python3.12 -m venv .venv && ./.venv/bin/python -m pip install -r requirements.txt yfinance"
+  echo "   cd \"$(pwd)\" && python3.12 -m venv .venv && ./.venv/bin/python -m pip install -r requirements.txt"
   echo
   read -r -p "Enter 를 누르면 닫힙니다..." _
   exit 1
+fi
+
+# .env 가 없으면 수급·공매도·밸류에이션 밴드가 통째로 비어 보인다.
+# 서버는 뜨므로 막지는 않고 경고만 한다.
+if [ ! -f ".env" ]; then
+  echo "⚠️  .env 가 없습니다 — 수급·공매도·밸류에이션 밴드가 비어 보입니다."
+  echo "   cp .env.example .env  후 KRX_ID / KRX_PW / OPENDART_API_KEY 를 채우세요."
+  echo
 fi
 
 echo "서버를 시작합니다 (포트 $PORT)…"
