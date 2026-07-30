@@ -114,6 +114,8 @@
   .badge{display:inline-block;border-radius:5px;padding:2px 8px;font-weight:600;font-size:11.5px}
   .badge.ok{background:#0f3f33;color:#4ade80;border:1px solid #17614e}
   .badge.no{background:#3f1620;color:#fb7185;border:1px solid #6d2436}
+/* 판정 보류(데이터 수집 중). 통과/미충족과 색으로 구분해 오독을 막는다 */
+.badge.na{background:#2a2f3a;color:#9aa5b4;border:1px solid #3c4451}
   .crit{display:inline-block;margin:2px 3px 0 0;font-size:11px;padding:1px 6px;
         border-radius:4px;border:1px solid var(--border)}
   .crit.y{color:#4ade80} .crit.n{color:#fb7185} .crit.na{color:#6b7684}
@@ -134,7 +136,7 @@
 
 <div id="toggles">
   <span class="btngroup"><button class="tfb on" data-tf="D">일봉</button><button class="tfb" data-tf="W">주봉</button><button class="tfb" data-tf="M">월봉</button></span>
-  <span class="btngroup"><button class="pdb" data-d="250">1년</button><button class="pdb on" data-d="750">3년</button><button class="pdb" data-d="1250">5년</button><button class="pdb" data-d="2600">10년</button><button class="pdb" data-d="5200">20년</button></span>
+  <span class="btngroup"><button class="pdb" data-d="250">1년</button><button class="pdb" data-d="750">3년</button><button class="pdb on" data-d="1250">5년</button><button class="pdb" data-d="2600">10년</button><button class="pdb" data-d="5200">20년</button></span>
   <label><input type="checkbox" id="t-ma" checked>이동평균(5·10·20·50·120)</label>
   <label><input type="checkbox" id="t-bb" checked>볼린저(20,2)</label>
   <label><input type="checkbox" id="t-hma" checked>HMA(60)</label>
@@ -377,7 +379,9 @@ window.addEventListener("resize", () => {
 // 동적 시리즈 (패턴 추세선 / 오더블록 박스)
 let patternSeries = [], obSeries = [];
 let CUR_TICKER = null;
-let PERIOD = 750;   // 서버에서 받아올 일봉 수 (기본 3년)
+// 기본 5년. 금리 인상/인하 사이클이 대략 2년 주기라 3년은 한 사이클을 겨우 담고
+// 비교 구간이 남지 않는다. 5년이면 사이클 두 번이 들어온다.
+let PERIOD = 1250;  // 서버에서 받아올 일봉 수 (기본 5년)
 let TF = "D";       // D=일봉 W=주봉 M=월봉 (재집계는 서버가 담당)
 function clearDynamic(list){
   list.forEach((s) => { try { mainChart.removeSeries(s); } catch(e){} });
@@ -491,14 +495,23 @@ function render(d){
       c5_close_above_ma50:"종가>50MA", c6_above_52w_low_30pct:"52주저가+30%↑",
       c7_within_25pct_of_52w_high:"52주고가-25%내", c8_rs_rating_70:"RS≥70",
     };
-    $("#mnv").innerHTML =
-      `<span class="badge ${mv.pass?'ok':'no'}">Minervini 추세템플릿 ${mv.pass?'통과':'미충족'}</span> ` +
+    // 벤치마크 지수는 첫 조회에서 백그라운드로 넘긴다(45초라 화면을 붙잡지 않음).
+    // 그동안 RS(c8)는 판정 불가인데, 이걸 그냥 '–'로 두면 조건 미충족처럼 읽힌다.
+    // 아직 못 받은 것과 실제로 못 넘긴 것을 구분해서 표시한다.
+    const rsPending = !!d.benchmark_note;
+    const badge = rsPending
+      ? `<span class="badge na">Minervini 판정 보류 <span class="sub">RS 지표 준비 중</span></span> `
+      : `<span class="badge ${mv.pass?'ok':'no'}">Minervini 추세템플릿 ${mv.pass?'통과':'미충족'}</span> `;
+    $("#mnv").innerHTML = badge +
       Object.keys(L).map(k=>{
         const v = mv[k];
+        if (k === "c8_rs_rating_70" && rsPending)
+          return `<span class="crit na">⏳ ${L[k]} 준비 중</span>`;
         const cls = v===true?"y":(v===false?"n":"na");
         return `<span class="crit ${cls}">${v===true?"✓":(v===false?"✗":"–")} ${L[k]}</span>`;
       }).join("") +
-      ` <span class="mk">52주저가 ${mv.pct_above_52w_low?.toFixed(0)}% / 고가 ${mv.pct_below_52w_high?.toFixed(0)}%</span>`;
+      ` <span class="mk">52주저가 ${mv.pct_above_52w_low?.toFixed(0)}% / 고가 ${mv.pct_below_52w_high?.toFixed(0)}%</span>` +
+      (rsPending ? ` <span class="mk">지수 수집 중 — 잠시 후 다시 조회하면 RS 까지 판정됩니다</span>` : "");
   } else { $("#mnv").innerHTML = ""; }
 
   volSeries.setData(dates.map((t,i)=>({
@@ -555,7 +568,11 @@ function render(d){
   } else {
     $("#short-panel").classList.add("off");
     shortQty.setData([]); shortRatio.setData([]);
-    $("#short-note").textContent = "비활성 — " + (sh.reason || "데이터 없음");
+    // '아직 못 받음'과 '데이터가 없음'을 구분한다. 전자는 다시 조회하면 나온다.
+    const pending = /준비 중|재시도|직전 실패/.test(sh.reason || "");
+    $("#short-note").textContent = pending
+      ? "수집 중 — 잠시 후 다시 조회하세요"
+      : "비활성 — " + (sh.reason || "데이터 없음");
   }
 
   // 헤더 메타
