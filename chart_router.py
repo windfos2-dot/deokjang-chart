@@ -246,11 +246,32 @@ def health():
         supply = f"KIS 폴백 — 최근 {loader.KIS_MAX_DAYS}영업일만"
     else:
         supply = "불가 — KRX_ID/KRX_PW 또는 KIS_APP_KEY/SECRET 필요"
+    # DART 키가 없으면 밸류에이션 밴드가 "DART 재무 없음" 으로, 시가총액 폴백이
+    # 조용히 죽는다. 화면만 보고는 코드 문제인지 설정 문제인지 알 수 없어서
+    # (실측: 맥에서 .env 미설정으로 두 패널이 동시에 비었다) 여기서 노출한다.
+    try:
+        import build_static as _bs
+        dart = bool(_bs._dart_key())
+    except Exception:  # noqa: BLE001
+        dart = False
+
+    missing = []
+    if not krx:
+        missing.append("KRX_ID/KRX_PW (수급·공매도)")
+    if not dart:
+        missing.append("OPENDART_API_KEY (밸류에이션 밴드)")
+
     return {
         "ok": True,
         "krx_login_configured": krx,
         "kis_configured": kis,
+        "dart_configured": dart,
         "supply_source": supply,
+        "bands_source": "DART" if dart else "불가 — OPENDART_API_KEY 필요",
+        "env_missing": missing or None,
+        "env_hint": (None if not missing else
+                     "cp .env.example .env 후 값을 채우고 서버를 재시작하세요"
+                     " (.env 는 기동 시점에 한 번만 읽습니다)"),
         "note": None if krx else loader._KRX_LOGIN_HINT,
     }
 
