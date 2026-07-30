@@ -42,6 +42,9 @@
   .chg.up{color:var(--up)} .chg.down{color:var(--down)}
   #banner{display:none;padding:8px 18px;background:#3b2a12;color:#f5c77e;
           font-size:12.5px;border-bottom:1px solid #5a4320}
+  /* 로딩 진행률. 패널이 반쯤 빈 상태를 보여주는 대신 여기서 퍼센트를 알린다 */
+  #loading{display:none;padding:8px 18px;background:#12263a;color:#7dd3fc;
+           font-size:12.5px;border-bottom:1px solid #1e4560;font-weight:600}
   main{padding:10px 14px 40px; margin-right:372px}
   @media (max-width:1100px){ main{margin-right:0} #side{position:static;width:auto;height:auto} }
   #side{position:fixed; right:0; top:0; width:360px; height:100vh; overflow-y:auto;
@@ -132,6 +135,7 @@
   <div id="meta"></div>
 </header>
 
+<div id="loading"></div>
 <div id="banner"></div>
 
 <div id="toggles">
@@ -562,7 +566,15 @@ function render(d){
   const sh = d.shorting || {available:false};
   if (sh.available && sh.balance_qty){
     $("#short-panel").classList.remove("off");
-    $("#short-note").textContent = `${sh.dates.length}일`;
+    // KRX 공매도 잔고는 약 2년(캘린더 730일)까지만 준다. 5년·10년 차트에서는
+    // 이 패널만 짧게 끝나므로 구간과 최신일을 적어 '업데이트 안 됨'으로 보이지 않게 한다.
+    // 잔고는 T+2 공시라 마지막 날짜가 주가보다 2~3영업일 뒤진다.
+    const sLast = sh.dates[sh.dates.length-1], sFirst = sh.dates[0];
+    const pLast = o.dates[o.dates.length-1];
+    $("#short-note").textContent =
+      `${sh.dates.length}일 (${sFirst}~${sLast})`
+      + (sLast < pLast ? ` · T+2 공시로 주가(${pLast})보다 뒤짐` : "")
+      + ` · KRX 는 약 2년만 제공`;
     shortQty.setData(pairs(sh.dates, sh.balance_qty));
     shortRatio.setData(pairs(sh.dates, sh.ratio));
   } else {
@@ -634,6 +646,7 @@ async function loadBands(ticker){
     }catch(e){ BAND_CACHE[ck] = {available:false, reason:e.message}; }
   }
   renderBand();
+  progStep("bands");
 }
 
 function renderBand(){
@@ -680,8 +693,15 @@ function renderBand(){
   const cur = vals[vals.length-1];
   const z = sd ? (cur-mean)/sd : 0;
   const pct = vals.filter(v=>v<=cur).length/vals.length*100;
+  // 평균·σ 는 '표시 중인 구간'으로만 계산된다. 종목에 따라 재무·발행주식수가
+  // 늦게 시작해 가격 차트보다 짧아지는데(실측: 5년 차트에서 밴드 2.3년),
+  // 구간을 안 적어두면 짧은 표본의 평균이 장기 평균처럼 읽힌다.
+  const yrs = (new Date(t1) - new Date(t0)) / (365.25*24*3600*1000);
+  const shortSpan = yrs < (PERIOD/252) * 0.8;
   note.innerHTML = `${d.basis} · 현재 <b>${cur.toFixed(2)}</b>${BAND_M==="ROE"?"%":"배"} · 평균 ${mean.toFixed(2)} · ` +
-    `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt;
+    `<b style="color:${z>1?'#f87171':(z<-1?'#4ade80':'#8b97a8')}">${z>=0?'+':''}${z.toFixed(1)}σ</b> · 하위 ${pct.toFixed(0)}%` + fwdTxt +
+    ` <span class="mk" ${shortSpan?'style="color:#f5c77e"':''}>· 표본 ${t0}~${t1} (${yrs.toFixed(1)}년)` +
+    `${shortSpan?" — 재무 시작이 늦어 차트보다 짧습니다":""}</span>`;
   // 데이터를 이미 가격 차트와 같은 날짜 구간으로 잘랐으므로 fitContent 면 겹친다.
   requestAnimationFrame(()=>bandChart.timeScale().fitContent());
 }
@@ -702,7 +722,8 @@ async function loadSignals(ticker){
     const r = await fetch(`${API_BASE}/api/chart/signals?ticker=${ticker}&basis=${BAND_B}`);
     if(!r.ok) throw new Error("HTTP "+r.status);
     d = await r.json();
-  }catch(e){ meta.textContent=""; body.innerHTML=`<div class="muted-note">조회 실패: ${e.message}</div>`; return; }
+    progStep("signals");
+  }catch(e){ progStep("signals"); meta.textContent=""; body.innerHTML=`<div class="muted-note">조회 실패: ${e.message}</div>`; return; }
 
   const lamp = c => `<span class="lamp ${c}"></span>`;
   const trend = d.frames.map(f=> f.available
@@ -738,7 +759,9 @@ async function loadMTF(ticker){
     const r = await fetch(`${API_BASE}/api/chart/mtf?ticker=${ticker}`);
     if(!r.ok) throw new Error("HTTP "+r.status);
     d = await r.json();
+    progStep("mtf");
   } catch(e){
+    progStep("mtf");
     meta.textContent = "";
     body.innerHTML = `<div class="muted-note">조회 실패: ${e.message}</div>`;
     return;
@@ -863,19 +886,47 @@ function renderEstimates(est, lastClose){
     </div>`;
 }
 
+// ---- 로딩 진행률 ----
+// 화면 하나가 완성되려면 /full · /signals · /bands · /mtf 네 요청이 끝나야 한다.
+// 단일 HTTP 요청의 실제 바이트 진행률은 알 수 없으므로 '완료한 요청 수 / 전체'를
+// 퍼센트로 보여준다. 반쯤 빈 패널을 보여주는 것보다 낫다.
+// 단계를 이름으로 추적한다. 같은 단계가 두 번 완료되어도(캐시 히트로 즉시
+// 끝나거나 버튼이 재호출) 진행률이 앞질러 100% 가 되지 않는다.
+const PROG_STEPS = ["full", "signals", "bands", "mtf"];
+const PROG = {done: new Set(), active:false};
+function progStart(){ PROG.done.clear(); PROG.active = true; progPaint(); }
+function progStep(name){
+  if(!PROG.active) return;
+  PROG.done.add(name);
+  if(PROG.done.size >= PROG_STEPS.length) PROG.active = false;
+  progPaint();
+}
+function progPaint(){
+  const el = $("#loading");
+  if(!el) return;
+  if(!PROG.active){ el.style.display = "none"; el.textContent = ""; return; }
+  el.style.display = "block";
+  const pending = PROG_STEPS.filter(s=>!PROG.done.has(s));
+  el.textContent = `데이터 가져오는 중… ${Math.round(PROG.done.size / PROG_STEPS.length * 100)}%`
+                 + (pending.length ? ` (남음: ${pending.join(", ")})` : "");
+}
+
 // ---- API ----
 async function loadTicker(code){
   hideBanner();
   CUR_TICKER = code;
+  progStart();
   try{
     const r = await fetch(`${API_BASE}/api/chart/full?ticker=${code}&days=${PERIOD}&tf=${TF}`);
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    render(d);
+    progStep("full");
+    render(d);                    // render 안에서 signals/bands/mtf 를 이어 띄운다
     if (d.trading && !d.trading.available)
       showBanner("⚠ 수급 데이터 비활성: " + d.trading.reason);
   }catch(e){
     showBanner("API 연결 실패 — 더미 데이터 미리보기 (" + e.message + ")");
+    PROG.active = false; progPaint();
     render(dummy());
   }
 }
