@@ -529,19 +529,49 @@ _DART_WANT = {
 }
 
 
+#: DART 키를 담는 환경변수/`.env` 항목 이름들. 프로젝트마다 다른 이름을 써서
+#: (spac_tracker.py 는 셋 다 지원한다) 하나만 보면 이미 있는 키를 놓친다.
+_DART_KEY_NAMES = ("OPENDART_API_KEY", "DART_API_KEY", "OPENDART_KEY")
+
+
 def _dart_key():
-    key = os.getenv("OPENDART_API_KEY")
-    if key:
-        return key
+    """OpenDART 인증키. 환경변수 -> 이 레포 .env -> 이웃 프로젝트 .env 순서.
+
+    키가 없으면 PER/PBR 밸류에이션 밴드와 DART 발행주식수 폴백이 조용히 죽는다
+    (`/bands` 가 "DART 재무 없음"으로 응답). 실측 2026-07-30: 폴더명이
+    `stock_bot`(밑줄)인데 `stock-bot`(하이픈)만 찾아서 못 잡고 있었다.
+    """
     import re
-    for path in (os.path.join(ROOT, ".env"),
-                 os.path.join(ROOT, os.pardir, "stock-bot", ".env")):
+
+    def valid(v):
+        """OpenDART 인증키는 40자 hex 다. 형식을 검증하지 않으면 이웃 .env 의
+        엉뚱한 값(실측: 88자짜리)을 집어와서 DART 가 zip 대신 에러 JSON 을
+        돌려주고 'File is not a zip file' 이라는 엉뚱한 예외로 터진다."""
+        if not v:
+            return None
+        v = v.split("#", 1)[0].strip().strip('"').strip("'")
+        return v if re.fullmatch(r"[0-9a-fA-F]{40}", v) else None
+
+    for name in _DART_KEY_NAMES:
+        key = valid(os.getenv(name))
+        if key:
+            return key
+
+    pat = re.compile(r"\s*(?:%s)\s*=\s*(.+?)\s*$" % "|".join(_DART_KEY_NAMES))
+    candidates = [os.path.join(ROOT, ".env")]
+    for sib in ("stock_bot", "stock-bot", "telegram_bot", "spac-tracker"):
+        candidates.append(os.path.join(ROOT, os.pardir, sib, ".env"))
+    candidates.append(os.path.expanduser("~/hermes-trade/.env"))
+
+    for path in candidates:
         try:
             with open(os.path.normpath(path), encoding="utf-8") as f:
                 for line in f:
-                    m = re.match(r"\s*OPENDART_API_KEY\s*=\s*(.+?)\s*$", line)
+                    m = pat.match(line)
                     if m:
-                        return m.group(1).strip().strip('"').strip("'")
+                        val = valid(m.group(1))
+                        if val:
+                            return val
         except OSError:
             continue
     return None
