@@ -773,38 +773,65 @@ function renderEstimates(est, lastClose){
   const ed = est.est_date ? `${est.est_date.slice(0,4)}-${est.est_date.slice(4,6)}-${est.est_date.slice(6)}` : "-";
   meta.innerHTML = est.opinion ? `<span class="op ${opCls}">${est.opinion}</span>` : "";
 
+  // 미국은 백만달러, 국내는 억원. 단위가 달라 포맷터를 분기한다.
+  const isUsd = (est.unit === "백만달러");
+  const usd = (v) => {                 // 백만달러 -> $B / $M
+    if (v === null || v === undefined) return "-";
+    const a = Math.abs(v);
+    if (a >= 1000) return "$" + (v/1000).toFixed(1) + "B";
+    return "$" + Math.round(v).toLocaleString() + "M";
+  };
+  const amt = isUsd ? usd : eok;
+
   const rows = est.rows.map(r=>`
     <tr class="${r.is_estimate?'est':''}">
-      <td>${r.period}</td>
-      <td>${eok(r.revenue)}</td>
-      <td>${eok(r.op_profit)}</td>
-      <td>${num(r.op_margin,1)}%</td>
+      <td>${r.period}${r.analysts?`<span class="sub"> ·${Math.round(r.analysts)}</span>`:""}</td>
+      <td>${amt(r.revenue)}</td>
+      <td>${amt(r.op_profit)}</td>
+      <td>${r.op_margin === null || r.op_margin === undefined ? "-" : num(r.op_margin,1)+"%"}</td>
       <td>${num(r.per,1)}</td>
       <td>${num(r.pbr,2)}</td>
     </tr>`).join("");
 
-  // 추정 구간 요약
+  // 추정 구간 요약. 미국은 포워드 PBR 이 없어(추정 BPS 부재) EPS 로 대체한다.
   const e1 = est.rows.find(r=>r.is_estimate);
+  const tile = (label, val) => `
+      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
+        <div class="sub">${label}</div>
+        <div style="font-size:16px;font-weight:600;color:var(--accent)">${val}</div>
+      </div>`;
   const summary = e1 ? `
     <div style="display:flex;gap:8px;margin:8px 0 6px">
-      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
-        <div class="sub">${e1.period} PER</div>
-        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.per,1)}배</div>
-      </div>
-      <div style="flex:1;background:#1b2432;border-radius:6px;padding:6px 8px">
-        <div class="sub">${e1.period} PBR</div>
-        <div style="font-size:16px;font-weight:600;color:var(--accent)">${num(e1.pbr,2)}배</div>
-      </div>
+      ${tile(`${e1.period} PER`, num(e1.per,1) + "배")}
+      ${e1.pbr !== null && e1.pbr !== undefined
+        ? tile(`${e1.period} PBR`, num(e1.pbr,2) + "배")
+        : tile(`${e1.period} EPS`, e1.eps ? "$" + num(e1.eps,2) : "-")}
+    </div>` : "";
+
+  // 목표주가 · 컨센서스 리비전 (미국 경로에서만 제공)
+  const tg = est.targets;
+  const extra = tg ? `
+    <div class="muted-note">
+      목표주가 평균 $${Math.round(tg.mean).toLocaleString()}
+      (중위 $${Math.round(tg.median).toLocaleString()} · 최고 $${Math.round(tg.high).toLocaleString()} · 최저 $${Math.round(tg.low).toLocaleString()})
+      ${est.price ? ` · 현재가 대비 ${((tg.mean/est.price-1)*100).toFixed(0)}%` : ""}
+    </div>` : "";
+  const rv = est.eps_revisions;
+  const revLine = (rv && rv.current) ? `
+    <div class="muted-note">
+      차기연도 EPS 컨센서스: 90일전 ${num(rv["90daysAgo"],2)} → 30일전 ${num(rv["30daysAgo"],2)} → 현재 ${num(rv.current,2)}
     </div>` : "";
 
   body.innerHTML = summary + `
     <table id="est-table">
       <tr><th>기간</th><th>매출</th><th>영업익</th><th>OPM</th><th>PER</th><th>PBR</th></tr>
       ${rows}
-    </table>
+    </table>` + extra + revLine + `
     <div class="muted-note">
       ${est.source === "FnGuide"
         ? `출처 FnGuide · 현재가 ${est.price ? Number(est.price).toLocaleString() : "-"}원${est.price_date?` (${est.price_date})`:""}`
+        : est.source === "yfinance+SEC"
+        ? `출처 실적 SEC EDGAR · 추정 yfinance · 현재가 $${est.price ? Number(est.price).toFixed(2) : "-"}${est.price_date?` (${est.price_date})`:""}${est.opinion?` · ${est.opinion}`:""}`
         : `출처 KIS · 시총 ${eok(est.mktcap_eok)} · 자본 ${eok(est.equity_eok)} · 추정일 ${ed}${est.analyst?` · ${est.analyst}`:""}`}
     </div>
     <div class="muted-note">${est.pbr_note}</div>
@@ -812,6 +839,8 @@ function renderEstimates(est, lastClose){
       ⚠️ <b>E 행은 증권사 추정치</b>입니다. 실적이 아니며 컨센서스는 자주 바뀝니다.
       ${est.source === "FnGuide"
         ? "E 행 배수는 현재가 ÷ 컨센서스 EPS·BPS 이고, 실적 연도는 결산기일 주가 기준입니다."
+        : est.source === "yfinance+SEC"
+        ? "E 행 PER 은 현재가 ÷ 컨센서스 EPS 입니다. 회사 제시 가이던스가 아니라 애널리스트 추정입니다."
         : "포워드 배수는 현재 시가총액 ÷ 추정치입니다."}
       추정이 틀리면 배수도 틀립니다. 숫자가 이례적이면 원자료(리포트)를 직접 확인하세요.
     </div>`;

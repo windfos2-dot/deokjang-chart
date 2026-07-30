@@ -482,10 +482,182 @@ def get_forward_estimates_fnguide(ticker):
     return out
 
 
+def get_forward_estimates_us(ticker):
+    """미국 종목 컨센서스 — 실적은 SEC EDGAR, 추정은 yfinance(야후 애널리스트).
+
+    국내(FnGuide)와 같은 자리를 미국에도 채운다. 단위는 **백만달러**.
+
+    국내와 다른 점(데이터가 없어서 생기는 한계이므로 없는 값은 None 으로 둔다):
+      - 추정 BPS 가 없다 -> 포워드 **PBR 을 만들 수 없다**. PER 만 포워드다.
+        (info['bookValue'] 는 실적치라 추정에 쓰면 안 된다)
+      - 영업이익 추정을 야후가 주지 않는다. 추정 행은 매출·EPS 만 채운다.
+      - 실적 연도 PER/PBR 은 여기서 만들지 않는다. /bands 가 SEC 재무 + 주가로
+        이미 PER/PBR 시계열을 계산하므로 중복이고, 결산기일 주가를 따로
+        맞추다 틀리는 것보다 비워두는 편이 낫다.
+
+    회계연도 라벨: yfinance 의 '0y'/'+1y' 는 상대 라벨이다. 절대연도는
+    info['nextFiscalYearEnd'](=진행 중 회계연도 종료일)로 붙인다.
+    실측 NVDA(1월 결산): lastFiscalYearEnd 2026-01-25, nextFiscalYearEnd
+    2027-01-25 -> 0y = FY2027, +1y = FY2028.
+
+    ⚠️ yfinance 는 야후 스크래핑이라 비공식이다. 실패 시 조용히 비운다.
+    """
+    key = ("fwd_us", ticker)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {"available": False, "reason": "yfinance 미설치"}
+
+    def _row(df, period, col):
+        try:
+            v = df.loc[period, col]
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if v != v else v            # NaN 제거
+
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        est = t.earnings_estimate
+        rev = t.revenue_estimate
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"yfinance 추정 조회 실패: {e}"}
+
+    if est is None or getattr(est, "empty", True):
+        return {"available": False, "reason": "애널리스트 커버리지 없음"}
+
+    # --- 진행 중 회계연도 = nextFiscalYearEnd 의 연도 ---
+    fy0 = None
+    try:
+        ts = info.get("nextFiscalYearEnd")
+        if ts:
+            fy0 = datetime.utcfromtimestamp(ts).year
+    except Exception:  # noqa: BLE001
+        pass
+
+    rows = []
+
+    # --- 실적 (SEC EDGAR) ---
+    hist = {}
+    try:
+        hist = sec_financials(ticker, years=6) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    for fy in sorted(hist):
+        f = hist[fy] or {}
+        r, op, ni = f.get("rev"), f.get("op"), f.get("ni")
+        rows.append({
+            "period": f"FY{fy}", "is_estimate": False,
+            "revenue": r / 1e6 if r else None,
+            "op_profit": op / 1e6 if op else None,
+            "net_income": ni / 1e6 if ni else None,
+            "op_margin": (op / r * 100) if (r and op is not None) else None,
+            "eps": None, "bps": None, "roe": None,
+            "per": None, "pbr": None, "multiple_basis": None,
+            "analysts": None,
+        })
+
+    # --- 현재가 (포워드 PER 산출 근거) ---
+    price = None
+    price_date = None
+    try:
+        o = get_ohlcv_us(ticker, days=10)
+        if o["close"]:
+            price = float(o["close"][-1])
+            price_date = o["dates"][-1]
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- 추정 (yfinance) ---
+    for i, period in enumerate(("0y", "+1y")):
+        eps = _row(est, period, "avg")
+        if eps is None:
+            continue
+        rv = _row(rev, period, "avg") if rev is not None else None
+        label = f"FY{fy0 + i}E" if fy0 else f"{period}E"
+        rows.append({
+            "period": label, "is_estimate": True,
+            "revenue": rv / 1e6 if rv else None,
+            "op_profit": None,                  # 야후가 영업이익 추정을 안 준다
+            "net_income": None,
+            "op_margin": None,
+            "eps": eps, "bps": None,
+            "roe": None,
+            "per": (price / eps) if (price and eps > 0) else None,
+            "pbr": None,                        # 추정 BPS 부재
+            "multiple_basis": "현재가",
+            "analysts": _row(est, period, "numberOfAnalysts"),
+        })
+
+    if not any(r["is_estimate"] for r in rows):
+        return {"available": False, "reason": "애널리스트 커버리지 없음"}
+
+    # --- 부가: 목표주가 · 리비전 추이 · 투자의견 분포 ---
+    targets = None
+    try:
+        tp = t.analyst_price_targets or {}
+        if tp.get("mean"):
+            targets = {k: tp.get(k) for k in ("mean", "median", "high", "low")}
+    except Exception:  # noqa: BLE001
+        pass
+
+    revisions = None
+    try:
+        tr = t.eps_trend
+        if tr is not None and not tr.empty:
+            revisions = {c: _row(tr, "+1y", c)
+                         for c in ("current", "30daysAgo", "90daysAgo")
+                         if c in tr.columns}
+    except Exception:  # noqa: BLE001
+        pass
+
+    opinion = None
+    try:
+        rc = t.recommendations
+        if rc is not None and not rc.empty:
+            r0 = rc.iloc[0]
+            buys = int(r0.get("strongBuy", 0)) + int(r0.get("buy", 0))
+            total = buys + int(r0.get("hold", 0)) + int(r0.get("sell", 0)) + \
+                int(r0.get("strongSell", 0))
+            if total:
+                opinion = f"매수 {buys}/{total}"
+    except Exception:  # noqa: BLE001
+        pass
+
+    out = {
+        "available": True,
+        "ticker": ticker,
+        "name": info.get("shortName") or ticker,
+        "source": "yfinance+SEC",
+        "currency": info.get("financialCurrency") or "USD",
+        "unit": "백만달러",
+        "price": price,
+        "price_date": price_date,
+        "opinion": opinion,
+        "targets": targets,
+        "eps_revisions": revisions,
+        "rows": rows,
+        "pbr_note": ("추정 행 PER 은 현재가 ÷ 컨센서스 EPS 다. 야후가 추정 BPS·영업이익을"
+                     " 주지 않아 포워드 PBR·영업이익은 비어 있다."
+                     " 실적 행 배수는 밸류에이션 밴드 패널을 참조."),
+    }
+    _ttl_set(key, out)
+    return out
+
+
 def get_forward_estimates(ticker):
     """컨센서스 추정실적 + 포워드 PER/PBR.
 
-    1순위 FnGuide(추정 3개년 · 주당지표 직접 제공), 실패 시 KIS 폴백.
+    미국 종목은 yfinance+SEC 경로로 분기한다(국내 소스는 국내 종목만 커버).
+    국내는 1순위 FnGuide(추정 3개년 · 주당지표 직접 제공), 실패 시 KIS 폴백.
     아래 본문은 KIS 경로다.
 
     소스: KIS 종목추정실적(HHKST668300C0) + 대차대조표(FHKST66430100).
@@ -503,6 +675,11 @@ def get_forward_estimates(ticker):
     cached = _ttl_get(key)
     if cached is not None:
         return cached
+
+    if is_us_ticker(ticker):
+        us = get_forward_estimates_us(ticker)
+        _ttl_set(key, us)
+        return us
 
     fng = get_forward_estimates_fnguide(ticker)
     if fng.get("available"):
