@@ -335,7 +335,9 @@ def full(ticker: str = Query(..., min_length=1, max_length=12),
     bench = None
     bench_note = None
     try:
-        bench = loader.get_benchmark_close(o["dates"], market=o.get("market") or "KOSPI")
+        bench = loader.get_benchmark_close(o["dates"],
+                                          market=o.get("market") or "KOSPI",
+                                          wait=False)
     except Exception as e:  # noqa: BLE001
         bench_note = f"벤치마크 미적용(RS 조건 제외): {e}"
 
@@ -390,6 +392,14 @@ def full(ticker: str = Query(..., min_length=1, max_length=12),
         payload["credit"] = loader.get_credit_balance(ticker, days=days)
     except Exception as e:  # noqa: BLE001
         payload["credit"] = {"available": False, "reason": f"신용 조회 실패: {e}"}
+
+    # 응답을 돌려준 뒤 백그라운드로 장기 구간을 미리 받아둔다. 사용자가 기간
+    # 버튼(5·10·20년)을 누를 때쯤엔 캐시가 차 있어 재조회 없이 잘라 쓴다.
+    # 최대 구간을 이 요청 경로에서 받으면 첫 로딩이 83초까지 늘어난다(실측).
+    try:
+        loader.prefetch_history(ticker)
+    except Exception:  # noqa: BLE001
+        pass
 
     return JSONResponse(payload)
 

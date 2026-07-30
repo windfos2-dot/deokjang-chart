@@ -1227,13 +1227,13 @@ _cache_lock = threading.Lock()
 _ttl_store: dict = {}
 
 
-def _ttl_get(key):
+def _ttl_get(key, ttl=None):
     with _cache_lock:
         item = _ttl_store.get(key)
         if item is None:
             return None
         ts, val = item
-        if time.time() - ts > _TTL_SECONDS:
+        if time.time() - ts > (ttl or _TTL_SECONDS):
             _ttl_store.pop(key, None)
             return None
         return val
@@ -1697,12 +1697,14 @@ def get_ohlcv(ticker, days=280):
     if is_us_ticker(ticker):          # 미국 종목은 yfinance 경로
         return get_ohlcv_us(ticker, days=days)
 
-    key = ("ohlcv", ticker, days)
+    # 종목 단위로 캐시하고 잘라 쓴다(기간 버튼마다 재조회 방지).
+    key = ("ohlcv_full", ticker)
     cached = _ttl_get(key)
-    if cached is not None:
-        return cached
+    if _covers(cached, days):
+        return _slice_series(cached, days, _OHLCV_SERIES_KEYS)
 
-    fromdate = _fromdate_for(days)
+    span = days
+    fromdate = _fromdate_for(span)
     todate = _today_str()
     # ⚠️ OHLCV(adjusted=True)는 네이버 소스라 KRX 로그인이 필요 없다.
     #    다만 pykrx 는 KRX_ID/PW 가 있으면 호출 전에 로그인을 먼저 시도하고,
@@ -1720,7 +1722,7 @@ def get_ohlcv(ticker, days=280):
     if df is None or df.empty:
         raise ValueError(f"OHLCV 데이터 없음: {ticker}")
 
-    df = df.tail(days)
+    df = df.tail(span)
 
     def col(*names):
         for n in names:
@@ -1738,9 +1740,10 @@ def get_ohlcv(ticker, days=280):
         "low": col("저가").astype(float).tolist(),
         "close": col("종가").astype(float).tolist(),
         "volume": col("거래량").astype(float).tolist(),
+        "_span": span,
     }
     _ttl_set(key, out)
-    return out
+    return _slice_series(out, days, _OHLCV_SERIES_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -1762,11 +1765,97 @@ def get_trading(ticker, days=280, verbose=False):
         if kis_configured():
             try:
                 out = get_trading_kis(ticker)
-                _ttl_set(("trading", ticker, days), out)
-                return out
+                _ttl_set(("trading_full", ticker), out)
+                return _slice_trading(out, days)
             except Exception as e:  # noqa: BLE001
                 raise KrxLoginRequired(f"수급(KIS 폴백도 실패: {e})") from e
         raise
+
+
+#: 수급은 **기간과 무관하게 매번 6~13초** 걸리는 고정비용 KRX 호출이다
+#: (실측 000660: 750일 9.6s / 2500일 6.3s / 5000일 12.4s — 기간에 비례하지 않는다).
+#: days 를 캐시 키에 넣으면 기간 버튼(1·3·5·10·20년)을 누를 때마다 캐시 미스가 나서
+#: 같은 데이터를 다시 받는다. 그래서 최대 구간을 한 번 받아 **종목 단위로** 캐시하고
+#: 요청 구간만 잘라 쓴다. 첫 조회는 조금 느려지지만 이후 기간 전환이 공짜가 된다.
+_TRADING_MAX_DAYS = 5200                    # 20년치 영업일 여유
+#: 벤치마크 지수 맵 TTL. 시장 단위 과거 시계열이라 장중에 바뀌지 않으므로 길게 잡는다.
+#: (기본 TTL 300초로는 44초짜리 조회를 5분마다 다시 하게 된다)
+_BENCH_TTL_SECONDS = 3600
+#: 공매도 잔고 조회 상한. KRX 는 긴 구간을 요청하면 예외 대신 **빈 응답**을 준다.
+#: 실측(068270, 2026-07-30): 캘린더 400일 266행 / 730일 482행 / 1000일 이상 빈 응답.
+#: _fromdate_for(days)=days*1.6+20 이므로 440 영업일 -> 724 캘린더일로 상한 안쪽이다.
+#: 이 상한을 넘겨 요청하면 매번 7초를 쓰고 실패하며, 실패는 캐시되지 않아
+#: 기간 버튼마다 그 비용을 다시 낸다(실측: /full 잔여 지연의 정체였다).
+_SHORT_MAX_DAYS = 440
+#: 실패를 재시도하지 않는 시간. 없으면 위 7초를 요청마다 반복한다.
+_NEG_TTL_SECONDS = 120
+_TRADING_SERIES_KEYS = ("dates", "외국인", "기관", "개인", "연기금")
+_OHLCV_SERIES_KEYS = ("dates", "open", "high", "low", "close", "volume")
+_SHORT_SERIES_KEYS = ("dates", "balance_qty", "balance_amount", "ratio")
+
+
+def _slice_series(full, days, keys):
+    """캐시된 시계열 dict 을 최근 days 봉으로 자른다(원본 dict 은 보존).
+
+    기간 버튼(1·3·5·10·20년)마다 days 가 바뀌는데, days 를 캐시 키에 넣으면
+    같은 원천 데이터를 매번 다시 받는다. 넉넉히 받아두고 여기서 잘라 쓰면
+    기간 전환이 공짜가 된다.
+    """
+    if not days:
+        return full
+    out = dict(full)
+    for k in keys:
+        v = full.get(k)
+        if isinstance(v, list) and len(v) > days:
+            out[k] = v[-days:]
+    return out
+
+
+def _slice_trading(full, days):
+    return _slice_series(full, days, _TRADING_SERIES_KEYS)
+
+
+def _covers(cached, days):
+    """캐시가 요청 구간을 덮는가. `_span` 은 '받아둔 요청 구간'이다.
+
+    ⚠️ 최대 구간을 요청 경로에서 받으면 안 된다. 실측(005930): 최대 구간을
+       첫 요청에 끼웠더니 첫 로딩이 11초 -> 83.8초가 됐다. 그래서 앞단은
+       요청받은 구간만 받고, 최대 구간은 백그라운드에서 승급한다.
+    """
+    return cached is not None and cached.get("_span", 0) >= days
+
+
+_prefetch_lock = threading.Lock()
+_prefetch_inflight = set()
+
+
+def prefetch_history(ticker):
+    """백그라운드로 최대 구간을 받아 캐시를 승급한다.
+
+    종목을 처음 그린 직후에 호출하면, 사용자가 기간 버튼을 누를 때쯤엔 캐시가
+    차 있어 즉시 전환된다. 실패는 무시한다 — 승급이 안 되면 그냥 그때 받는다.
+    """
+    with _prefetch_lock:
+        if ticker in _prefetch_inflight:
+            return
+        _prefetch_inflight.add(ticker)
+
+    def work():
+        try:
+            # 공매도는 KRX 상한(_SHORT_MAX_DAYS)을 넘기면 빈 응답이라 따로 준다.
+            for fn, span in ((get_ohlcv, _TRADING_MAX_DAYS),
+                             (get_trading, _TRADING_MAX_DAYS),
+                             (get_shorting_balance, _SHORT_MAX_DAYS)):
+                try:
+                    fn(ticker, days=span)
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            with _prefetch_lock:
+                _prefetch_inflight.discard(ticker)
+
+    threading.Thread(target=work, daemon=True,
+                     name=f"prefetch-{ticker}").start()
 
 
 def _get_trading_pykrx(ticker, days=280, verbose=False):
@@ -1774,12 +1863,13 @@ def _get_trading_pykrx(ticker, days=280, verbose=False):
 
     컬럼명이 pykrx 버전마다 다를 수 있어 유연 매핑한다 (지시서 §7.2).
     """
-    key = ("trading", ticker, days)
+    key = ("trading_full", ticker)
     cached = _ttl_get(key)
-    if cached is not None:
-        return cached
+    if _covers(cached, days):
+        return _slice_trading(cached, days)
 
-    fromdate = _fromdate_for(days)
+    span = days
+    fromdate = _fromdate_for(span)
     todate = _today_str()
     try:
         df = _pykrx(stock.get_market_trading_value_by_date,
@@ -1791,7 +1881,7 @@ def _get_trading_pykrx(ticker, days=280, verbose=False):
         # KRX 비로그인 시 pykrx는 예외 대신 빈 DF를 반환한다 (실측).
         raise KrxLoginRequired("수급")
 
-    df = df.tail(days)
+    df = df.tail(span)
     cols = list(df.columns)
     if verbose:
         print(f"[loader] 수급 컬럼({ticker}): {cols}")
@@ -1831,10 +1921,10 @@ def _get_trading_pykrx(ticker, days=280, verbose=False):
         "개인": to_list(individual),
         "연기금": to_list(pension),
         "source": "KRX(pykrx)", "unit": "원(거래대금)",
-        "_columns": cols,
+        "_columns": cols, "_span": span,
     }
     _ttl_set(key, out)
-    return out
+    return _slice_trading(out, days)
 
 
 # ---------------------------------------------------------------------------
@@ -1842,20 +1932,28 @@ def _get_trading_pykrx(ticker, days=280, verbose=False):
 # ---------------------------------------------------------------------------
 def get_shorting_balance(ticker, days=280):
     """공매도 잔고. 반환: dict(dates, balance_qty, balance_amount, ratio)."""
-    key = ("short", ticker, days)
+    key = ("short_full", ticker)             # 수급과 같은 이유로 종목 단위 캐시
     cached = _ttl_get(key)
-    if cached is not None:
-        return cached
+    if _covers(cached, days):
+        return _slice_series(cached, days, _SHORT_SERIES_KEYS)
 
-    fromdate = _fromdate_for(days)
+    # 직전 실패를 짧게 기억한다(위 _NEG_TTL_SECONDS 주석 참조).
+    neg_key = ("short_fail", ticker)
+    if _ttl_get(neg_key, ttl=_NEG_TTL_SECONDS):
+        raise KrxLoginRequired("공매도잔고(직전 실패 — 잠시 후 재시도)")
+
+    span = min(days, _SHORT_MAX_DAYS)        # 상한을 넘기면 빈 응답이 온다
+    fromdate = _fromdate_for(span)
     todate = _today_str()
     try:
         df = _pykrx(stock.get_shorting_balance_by_date, fromdate, todate, ticker)
     except Exception as e:  # noqa: BLE001
+        _ttl_set(neg_key, True)
         raise KrxLoginRequired("공매도잔고") from e
     if df is None or df.empty:
+        _ttl_set(neg_key, True)
         raise KrxLoginRequired("공매도잔고")
-    df = df.tail(days)
+    df = df.tail(span)
     cols = list(df.columns)
 
     def find_col(*cands):
@@ -1871,9 +1969,12 @@ def get_shorting_balance(ticker, days=280):
         "balance_amount": find_col("공매도금액", "잔고금액"),
         "ratio": find_col("비중"),
         "_columns": cols,
+        # 상한까지 받았으면 그게 KRX 가 주는 전부다. 더 긴 요청이 와도
+        # 재조회할 이유가 없으므로 '전부 덮는다'고 표시한다.
+        "_span": _TRADING_MAX_DAYS if span >= _SHORT_MAX_DAYS else span,
     }
     _ttl_set(key, out)
-    return out
+    return _slice_series(out, days, _SHORT_SERIES_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -1990,28 +2091,73 @@ def get_index_ohlcv_openapi(name="KOSPI", days=280, workers=6):
     return out
 
 
-def get_benchmark_close(dates, market="KOSPI"):
+def _prefetch_benchmark(market):
+    """벤치마크 지수 맵을 백그라운드로 받아둔다(시장 단위, 1회)."""
+    tag = f"bench:{market}"
+    with _prefetch_lock:
+        if tag in _prefetch_inflight:
+            return
+        _prefetch_inflight.add(tag)
+
+    def work():
+        try:
+            get_benchmark_close([], market=market, wait=True)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _prefetch_lock:
+                _prefetch_inflight.discard(tag)
+
+    threading.Thread(target=work, daemon=True, name=f"prefetch-{tag}").start()
+
+
+def get_benchmark_close(dates, market="KOSPI", wait=True):
     """종목 날짜열에 정렬된 벤치마크 지수 종가 리스트.
 
     dates 와 길이가 같은 list 를 반환하며, 지수 데이터가 없는 날짜는 직전 값으로
     채운다(휴장 등). 조회 실패 시 KrxLoginRequired.
+
+    wait=False 면 맵이 아직 없을 때 기다리지 않고 백그라운드 조회만 걸고 즉시
+    예외를 낸다. /full 이 이걸 쓴다 — RS 조건 하나 때문에 첫 화면을 45초
+    붙잡아둘 이유가 없다.
     """
     code = _INDEX_CODE.get(market, "1001")
-    key = ("bench", code, dates[0] if dates else "", dates[-1] if dates else "")
-    cached = _ttl_get(key)
-    if cached is not None:
-        return cached
 
-    fromdate = dates[0].replace("-", "") if dates else _fromdate_for(280)
-    todate = dates[-1].replace("-", "") if dates else _today_str()
-    by_date = None
-    try:
-        df = _pykrx(stock.get_index_ohlcv_by_date, fromdate, todate, code)
-        if df is not None and not df.empty:
-            by_date = {d.strftime("%Y-%m-%d"): float(v)
-                       for d, v in zip(df.index, df["종가"].astype(float))}
-    except Exception:  # noqa: BLE001
+    # ⚠️ 여기가 /full 의 최대 병목이었다. 실측(051910, 750일): 이 함수 한 번에
+    #    44초. 지표 계산은 0.18초, 수급 15초, OHLCV 1.1초였다.
+    #    원인은 비용이 아니라 캐시 키였다 — (code, 시작일, 종료일) 이라서
+    #    기간 버튼(1·3·5·10·20년)을 누를 때마다 키가 바뀌어 매번 재조회했다.
+    #    벤치마크는 **종목이 아니라 시장 단위** 데이터이므로, 날짜→종가 맵을
+    #    시장별로 넓게 한 번 받아두면 모든 종목·모든 기간에 재사용된다.
+    #    지수 과거값은 장중에 바뀌지 않으니 TTL 도 길게 준다.
+    map_key = ("bench_map", code)
+    cached_map = _ttl_get(map_key, ttl=_BENCH_TTL_SECONDS) or {}
+    by_date = cached_map.get("map")
+    need_from = dates[0] if dates else None
+    covered = bool(by_date) and (not need_from or cached_map.get("from", "9999") <= need_from)
+
+    if not covered and not wait:
+        # 첫 조회는 45초가 걸린다. 라우터가 벤치마크 실패를 'RS 조건 제외'로
+        # 흘려보내도록 되어 있으므로, 사용자를 세워두지 않고 백그라운드로 받는다.
+        # 다음 조회(기간 버튼 등)부터 RS 조건이 붙는다.
+        _prefetch_benchmark(market)
+        raise KrxLoginRequired("벤치마크지수 준비 중 — RS 조건은 다음 조회부터")
+
+    if not covered:
+        # 요청 구간보다 넉넉하게(20년) 받아 이후 기간 전환까지 한 번에 덮는다.
+        wide_from = _fromdate_for(_TRADING_MAX_DAYS)
+        fromdate = min(wide_from, need_from.replace("-", "")) if need_from else wide_from
+        todate = _today_str()
         by_date = None
+        try:
+            df = _pykrx(stock.get_index_ohlcv_by_date, fromdate, todate, code)
+            if df is not None and not df.empty:
+                by_date = {d.strftime("%Y-%m-%d"): float(v)
+                           for d, v in zip(df.index, df["종가"].astype(float))}
+                _ttl_set(map_key, {"map": by_date,
+                                   "from": f"{fromdate[:4]}-{fromdate[4:6]}-{fromdate[6:]}"})
+        except Exception:  # noqa: BLE001
+            by_date = None
 
     if not by_date:
         # pykrx 는 KRX 웹로그인이 필요하다. 계정이 잠겨도 오픈API 로는 받을 수 있다.
@@ -2029,11 +2175,11 @@ def get_benchmark_close(dates, market="KOSPI"):
             raise KrxLoginRequired("벤치마크지수(캐시 없음 — RS 조건 제외)")
     if not by_date:
         raise KrxLoginRequired("벤치마크지수")
+    # 정렬은 O(n) 이라 캐시할 필요가 없다. 비싼 것은 위의 지수 조회였다.
     out, last = [], None
     for d in dates:
         last = by_date.get(d, last)
         out.append(last)
-    _ttl_set(key, out)
     return out
 
 
