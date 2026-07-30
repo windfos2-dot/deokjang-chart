@@ -340,8 +340,153 @@ def _f(v):
     return x
 
 
+_FNG_URL = "https://wcomp.fnguide.com/CompanyInfo/getSnpFinancial"
+
+
+def _fng_num(v):
+    """FnGuide 값 파싱. 결측은 None, 'N/A' 문자열도 None 으로 눕힌다."""
+    if v is None:
+        return None
+    s = str(v).strip().replace(",", "")
+    if not s or s.upper() in ("N/A", "-", "NA"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def get_forward_estimates_fnguide(ticker):
+    """FnGuide 컨센서스 + **현재가 기준** 포워드 PER/PBR.
+
+    KIS 경로보다 이걸 우선한다:
+      - 추정 3개년(2026E~2028E) vs KIS 2개년, 실적 5개년 vs 3개년
+      - 추정 EPS/BPS 를 직접 주므로 PBR 이 근사치가 아니다
+        (KIS 경로는 '최근 자본총계 + 추정 순이익 누계'로 배당을 무시했다)
+      - 주당 지표라 시가총액·발행주식수가 불필요하다. 장 시작 직후 KRX 시총이
+        빈 값으로 오는 문제(pykrx 가 ""->0 치환)를 아예 우회한다.
+
+    ⚠️ FnGuide 화면이 쓰는 비공식 엔드포인트다. 스펙이 바뀌면 조용히 실패하므로
+       호출부는 반드시 KIS 폴백을 유지해야 한다.
+
+    ⚠️ FnGuide 가 주는 PER/PBR 컬럼은 쓰지 않는다. 추정 연도는 페이지 생성일
+       주가 하나로 3개년을 다 계산한 스냅샷이다(실측: 삼양식품 2026E~2028E 역산
+       주가가 1,219,701 / 1,220,169 / 1,219,599 로 사실상 동일). 하루 만에 7.2%
+       움직인 종목에서 PER 이 16.3 -> 17.5 로 벌어졌다. 그래서 현재가로 다시 계산한다.
+
+    ⚠️ '영업이익' 행은 추정 연도가 비어 있고 '영업이익(발표기준)' 행에만 값이
+       들어온다. 순이익/EPS/BPS 는 FnGuide 주석대로 지배주주 기준을 쓴다.
+    """
+    key = ("fwd_fng", ticker)
+    cached = _ttl_get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        headers = dict(_UA)
+        headers["Referer"] = f"https://wcomp.fnguide.com/?c_id=AA&menu_type=01&cmp_cd={ticker}"
+        r = requests.get(_FNG_URL, params={"cmp_cd": ticker, "consol_typ": "M",
+                                           "freq_typ": "Y"},
+                         headers=headers, timeout=20)
+        ds = r.json().get("dataset") or {}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"FnGuide 조회 실패: {e}"}
+
+    header = ds.get("header") or []
+    data = ds.get("data") or []
+    if not header or not data:
+        return {"available": False, "reason": "FnGuide 커버리지 없음"}
+
+    by_name = {}
+    for row in data:
+        nm = re.sub(r"<[^>]+>", "", str(row.get("NAME") or "")).strip()
+        if nm and nm not in by_name:
+            by_name[nm] = row
+
+    n = len(header)
+    periods = [h.get("YYMM", "") + ("E" if (h.get("EP_CHK") or "").strip() == "E" else "")
+               for h in header]
+
+    def series(*names):
+        """이름 후보를 순서대로 시도해 첫 번째로 존재하는 행을 시계열로 준다."""
+        for nm in names:
+            row = by_name.get(nm)
+            if row:
+                return [_fng_num(row.get(f"VAL{i}")) for i in range(1, n + 1)]
+        return [None] * n
+
+    revenue = series("매출액")
+    # 추정 연도는 '영업이익(발표기준)' 에만 값이 있다.
+    op_profit = series("영업이익(발표기준)", "영업이익")
+    net_income = series("당기순이익(지배)", "당기순이익")
+    eps = series("EPS")
+    bps = series("BPS")
+    opm_given = series("영업이익률")
+    roe = series("ROE")
+    # 실적 연도용. FnGuide 는 각 결산기일 수정주가로 계산해두므로 과거 밸류
+    # 히스토리로는 이 값이 맞다. 현재가를 과거 EPS 에 적용하면 안 된다
+    # (실측: 삼양식품 2021년에 현재가를 쓰면 PER 175배 — 실제는 12.7배).
+    per_hist = series("PER")
+    pbr_hist = series("PBR")
+
+    if not any(v is not None for v in revenue):
+        return {"available": False, "reason": "FnGuide 재무 데이터 없음"}
+
+    # --- 현재가 (포워드 배수를 실시간으로 재계산하는 근거) ---
+    price = None
+    price_date = None
+    try:
+        o = get_ohlcv(ticker, days=5)
+        if o["close"]:
+            price = float(o["close"][-1])
+            price_date = o["dates"][-1]
+    except Exception:  # noqa: BLE001
+        pass
+
+    rows = []
+    for i, p in enumerate(periods):
+        is_est = p.endswith("E")
+        if is_est:
+            # 포워드 배수만 현재가로 다시 계산한다. 오늘 판단에 쓰는 숫자이므로
+            # 페이지 생성일 주가로 굳어 있으면 안 된다.
+            per = (price / eps[i]) if (price and eps[i] and eps[i] > 0) else None
+            pbr = (price / bps[i]) if (price and bps[i] and bps[i] > 0) else None
+            basis = "현재가"
+        else:
+            per, pbr = per_hist[i], pbr_hist[i]
+            basis = "결산기일"
+        opm = opm_given[i]
+        if opm is None and revenue[i] and op_profit[i] is not None:
+            opm = op_profit[i] / revenue[i] * 100
+        rows.append({
+            "period": p, "is_estimate": is_est,
+            "revenue": revenue[i], "op_profit": op_profit[i],
+            "net_income": net_income[i], "op_margin": opm,
+            "eps": eps[i], "bps": bps[i], "roe": roe[i],
+            "per": per, "pbr": pbr, "multiple_basis": basis,
+        })
+
+    out = {
+        "available": True,
+        "ticker": ticker,
+        "name": get_ticker_name(ticker),
+        "source": "FnGuide",
+        "price": price,
+        "price_date": price_date,
+        "unit": "억원",
+        "rows": rows,
+        "pbr_note": ("추정 연도(E) 배수는 현재가 ÷ 컨센서스 EPS·BPS 로 재계산한 값이고,"
+                     " 실적 연도는 결산기일 수정주가 기준이다(각 행 multiple_basis 참조)."),
+    }
+    _ttl_set(key, out)
+    return out
+
+
 def get_forward_estimates(ticker):
-    """컨센서스 추정실적 + 현재 시가총액 기준 포워드 PER/PBR.
+    """컨센서스 추정실적 + 포워드 PER/PBR.
+
+    1순위 FnGuide(추정 3개년 · 주당지표 직접 제공), 실패 시 KIS 폴백.
+    아래 본문은 KIS 경로다.
 
     소스: KIS 종목추정실적(HHKST668300C0) + 대차대조표(FHKST66430100).
     단위는 KIS 관례대로 억원.
@@ -358,6 +503,11 @@ def get_forward_estimates(ticker):
     cached = _ttl_get(key)
     if cached is not None:
         return cached
+
+    fng = get_forward_estimates_fnguide(ticker)
+    if fng.get("available"):
+        _ttl_set(key, fng)
+        return fng
 
     if not kis_configured():
         return {"available": False, "reason": "KIS_APP_KEY / KIS_APP_SECRET 미설정"}
@@ -397,6 +547,11 @@ def get_forward_estimates(ticker):
             cap_src = "KRX"
     except Exception:  # noqa: BLE001
         pass
+    # pykrx 는 빈 값을 0 으로 치환해서(df.replace("", 0)) 장 시작 직후 당일
+    # 시총을 조회하면 None 이 아니라 0.0 이 돌아온다. `is None` 만 보면 폴백이
+    # 걸리지 않아 시총 0 으로 PER/PBR 이 전부 0 이 됐다(실측 2026-07-30 09:10).
+    if not mktcap_eok or mktcap_eok <= 0:
+        mktcap_eok = None
     if mktcap_eok is None:
         # 폴백: 최근 종가 × DART 발행주식수.
         # (이전엔 KRX 월말시총 캐시의 마지막 값을 썼는데, 부분 수집으로 캐시가

@@ -803,13 +803,17 @@ function renderEstimates(est, lastClose){
       ${rows}
     </table>
     <div class="muted-note">
-      시총 ${eok(est.mktcap_eok)} · 자본 ${eok(est.equity_eok)} · 추정일 ${ed}${est.analyst?` · ${est.analyst}`:""}
+      ${est.source === "FnGuide"
+        ? `출처 FnGuide · 현재가 ${est.price ? Number(est.price).toLocaleString() : "-"}원${est.price_date?` (${est.price_date})`:""}`
+        : `출처 KIS · 시총 ${eok(est.mktcap_eok)} · 자본 ${eok(est.equity_eok)} · 추정일 ${ed}${est.analyst?` · ${est.analyst}`:""}`}
     </div>
     <div class="muted-note">${est.pbr_note}</div>
     <div class="warn">
       ⚠️ <b>E 행은 증권사 추정치</b>입니다. 실적이 아니며 컨센서스는 자주 바뀝니다.
-      포워드 배수는 현재 시가총액 ÷ 추정치라, 추정이 틀리면 배수도 틀립니다.
-      숫자가 이례적이면 원자료(리포트)를 직접 확인하세요.
+      ${est.source === "FnGuide"
+        ? "E 행 배수는 현재가 ÷ 컨센서스 EPS·BPS 이고, 실적 연도는 결산기일 주가 기준입니다."
+        : "포워드 배수는 현재 시가총액 ÷ 추정치입니다."}
+      추정이 틀리면 배수도 틀립니다. 숫자가 이례적이면 원자료(리포트)를 직접 확인하세요.
     </div>`;
 }
 
