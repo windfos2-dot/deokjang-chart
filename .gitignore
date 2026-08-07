@@ -9,6 +9,19 @@ __pycache__/
 .chart_cache/
 .DS_Store
 
+# 패턴 스크리너 시세 캐시 (chart_patterns/ohlcv.db 는 415MB). 재생성 가능하므로
+# 커밋하지 않는다 — `python -m chart_patterns.ohlcv --market ALL --days 400`.
+*.db
+chart_patterns/output/
+output/
+
+# 책 원문 — 절대 커밋 금지.
+# Bulkowski, *Encyclopedia of Chart Patterns* (3rd ed.) 를 파싱한 결과물이라
+# 식별규칙·매매전술이 영문 원문 그대로 들어 있다. 이 레포는 공개이므로
+# 커밋하면 저작물을 재배포하는 셈이 된다. 책을 가진 사람이 각자 만들어 쓴다:
+#   python chart_patterns/extract_book.py     (본인 PDF 필요)
+chart_patterns/book_patterns.json
+
 # 정적 빌드 산출물은 커밋한다 (스팩 트래커와 동일 방식).
 # build_static.py 를 로컬에서 돌려 docs/ 를 채우고 그대로 푸시하면
 # GitHub Pages 가 서빙한다. Actions 는 쓰지 않는다.

@@ -27,6 +27,8 @@ python3.12 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 | `chart_data_loader.py` | 데이터 로더 (pykrx + KIND + KRX) · TTL 300초 캐시 |
 | `chart_router.py` | FastAPI 라우터 `/api/chart/*` |
 | `static/chart_live.html` | 프론트 (lightweight-charts 4.2.3) |
+| `chart_patterns/` | Bulkowski 차트패턴 스크리너 (73/75 패턴) — 원래 별도 프로젝트였다 |
+| `chart_patterns_bridge.py` | 위 스크리너를 단일 종목 차트 오버레이로 변환하는 어댑터 |
 
 ## 엔드포인트
 
@@ -34,8 +36,12 @@ python3.12 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 GET /api/chart/health                              모듈 상태 + KRX 로그인 게이트
 GET /api/chart/search?q=삼성전자                     종목 검색
 GET /api/chart/ohlcv?ticker=005930&days=280        OHLCV
-GET /api/chart/full?ticker=005930&days=280         OHLCV+전지표+수급 (프론트 메인)
+GET /api/chart/full?ticker=005930&days=280         OHLCV+전지표+수급+패턴 (프론트 메인)
 GET /api/chart/ui                                  차트 페이지
+
+GET /api/chart/patterns?ticker=005930&recent=60    Bulkowski 패턴 (탐색 구간 조절용)
+GET /api/chart/patterns/catalog                    구현된 73패턴 목록
+GET /api/chart/pattern/{pid}                       책 식별규칙·매매전술 원문
 ```
 
 `/full` 은 `sr_vol_thresh` (기본 20) 로 S/R 돌파 거래량 필터를 조절할 수 있다.
@@ -55,6 +61,47 @@ RSI(14, Wilder), MA이격도(50), Hull MA(60)
 - **S/R + 돌파** — [LuxAlgo 공개 오픈소스 로직](https://www.tradingview.com/script/JDFoWQbL-Support-and-Resistance-Levels-with-Breaks-LuxAlgo/)
   재구현 (pivot 15/15, 거래량 오실 20%, 꼬리 필터 포함)
 - **오더블록** — 임펄스 직전 반대색 캔들, 거래량 표기
+
+## Bulkowski 패턴 오버레이
+
+Thomas Bulkowski, *Encyclopedia of Chart Patterns* (3rd ed.) 의 식별규칙을 옮긴
+`chart_patterns` 를 단일 종목 차트에 얹은 것이다. 원래 전종목 스크리너라
+방향이 반대인데, `chart_patterns_bridge.py` 가 그 간극을 메운다.
+
+- 감지된 패턴을 **외곽선**(방향색)으로 그리고, 선택한 패턴은 **구름대**(캔들 뒤
+  음영)로 구간을 강조한다. 트리거·목표는 가격선, 돌파 시점은 캔들 마커.
+- 태그에 종합점수(책 통계 45% + 형태적합 35% + 확인도 20%)를, 상세줄에 책의
+  평균 수익률·손익분기 실패율·순위를 띄운다. 국면(강세/약세)은 벤치마크 지수의
+  200일선 위/아래로 판정한다.
+- 탐색 구간 버튼(10/20/60/150봉)은 **패턴의 돌파(또는 완성) 시점**을 최근 몇 봉
+  까지 인정할지다. 기본 60봉. 바꾸면 OHLCV 재조회 없이 다시 탐지한다.
+- 시세 DB(`chart_patterns/ohlcv.db`, 415MB)는 **스캔 CLI 전용**이다. 차트
+  오버레이는 덕장차트가 이미 받은 OHLCV 를 그대로 쓰므로 DB 가 없어도 된다.
+  (DB 는 커밋하지 않는다 — `python -m chart_patterns.ohlcv --market ALL --days 400`)
+
+### ⚠ 책 데이터는 이 레포에 없다
+
+패턴 이름·식별규칙·성과통계가 담긴 `chart_patterns/book_patterns.json` 은
+Bulkowski 책을 파싱한 결과물이라 **커밋하지 않는다**(`.gitignore`). 이 레포는
+공개라서 커밋하면 저작물을 재배포하는 셈이 된다. 책을 가진 사람이 각자 만든다:
+
+```bash
+python chart_patterns/extract_book.py     # 본인 PDF 필요
+```
+
+파일이 없으면 **패턴 오버레이만 조용히 꺼진다**. 차트·지표·수급·밸류에이션과
+공개 사이트(`docs/`)는 이 파일과 무관하게 그대로 동작한다. 켜졌는지는
+`/api/chart/health` 의 `patterns_available` 로 확인한다.
+
+**알려진 한계**
+
+- 같은 패턴이 구간 안에서 여러 번 나와도 **패턴 종류당 1건**만 남는다
+  (`detectors.run` 이 완성도 기준으로 추린다). 과거 전 구간 라벨링용이 아니다.
+- 측정룰 목표가는 `트리거 ± 패턴높이` 라서 키 큰 패턴에서 비현실적인 값이 나온다.
+  0 이하로 내려가면 '목표 없음'으로 처리하고, 차트 범위를 벗어나면 숫자만 띄우고
+  선은 생략한다. **같은 값이 스크리너 표의 목표여력 칼럼에는 그대로 나온다.**
+- 책 통계는 1990~2019 미국 표본이다. 국장 절대 기대치가 아니라 패턴 간 상대
+  우선순위로만 쓸 것.
 
 ## 데이터 소스
 

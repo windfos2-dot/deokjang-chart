@@ -6,6 +6,10 @@ chart_router.py — EMS 차트 모듈 FastAPI 라우터 (/api/chart/*)
     GET /api/chart/ohlcv?ticker=005930&days=280
     GET /api/chart/full?ticker=005930&days=280
 
+확장:
+    GET /api/chart/patterns?ticker=005930&days=1250&tf=D&recent=20
+    GET /api/chart/pattern/{pid}          책 식별규칙·매매전술 원문
+
 헌법 준수 (§1):
     - 신규 파일만 생성. 기존 EMS 파일(server.py 등)은 건드리지 않는다.
     - 네임스페이스는 /api/chart/* 로 IPO(/api/ipo-report/*)와 분리.
@@ -31,6 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 import chart_data_loader as loader
 import chart_indicators as ind
+import chart_patterns_bridge as cpb
 
 router = APIRouter(prefix="/api/chart", tags=["chart"])
 
@@ -266,6 +271,9 @@ def health():
         "krx_login_configured": krx,
         "kis_configured": kis,
         "dart_configured": dart,
+        "patterns_available": cpb.available(),
+        "patterns_count": len(cpb.pattern_catalog()) or None,
+        "patterns_error": cpb.import_error(),
         "supply_source": supply,
         "bands_source": "DART" if dart else "불가 — OPENDART_API_KEY 필요",
         "env_missing": missing or None,
@@ -303,6 +311,45 @@ def ohlcv(ticker: str = Query(..., min_length=1, max_length=12),
 # ---------------------------------------------------------------------------
 # 전체 (프론트 메인)
 # ---------------------------------------------------------------------------
+def _resample(o: dict, tf: str) -> dict:
+    """일봉 dict 을 주/월봉으로 재집계 (tf='D' 면 그대로).
+
+    클라이언트에서 재집계하면 서버가 계산한 지표(이동평균·패턴·오더블록…)와
+    봉이 어긋난다. 여기서 먼저 집계한 뒤 지표를 계산해야 전부 그 봉 기준이 된다.
+    """
+    if tf == "D":
+        return o
+
+    def _key(dstr):
+        if tf == "W":
+            y, w, _ = date(int(dstr[:4]), int(dstr[5:7]), int(dstr[8:10])).isocalendar()
+            return f"{y}-W{w:02d}"
+        return dstr[:7]
+
+    agg, order = {}, []
+    for i, dstr in enumerate(o["dates"]):
+        k = _key(dstr)
+        if k not in agg:
+            agg[k] = {"d": dstr, "o": o["open"][i], "h": o["high"][i],
+                      "l": o["low"][i], "c": o["close"][i], "v": o["volume"][i]}
+            order.append(k)
+        else:
+            b = agg[k]
+            b["h"] = max(b["h"], o["high"][i])
+            b["l"] = min(b["l"], o["low"][i])
+            b["c"] = o["close"][i]
+            b["v"] += o["volume"][i]
+            b["d"] = dstr
+    return {**o,
+            "dates": [agg[k]["d"] for k in order],
+            "open": [agg[k]["o"] for k in order],
+            "high": [agg[k]["h"] for k in order],
+            "low": [agg[k]["l"] for k in order],
+            "close": [agg[k]["c"] for k in order],
+            "volume": [agg[k]["v"] for k in order],
+            "tf": tf}
+
+
 @router.get("/full")
 def full(ticker: str = Query(..., min_length=1, max_length=12),
          days: int = Query(280, ge=30, le=6000),
@@ -319,38 +366,7 @@ def full(ticker: str = Query(..., min_length=1, max_length=12),
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=404, detail=f"OHLCV 조회 실패({ticker}): {e}") from e
 
-    # --- 봉 재집계 (주/월) ---
-    # 클라이언트에서 재집계하면 서버가 계산한 지표(이동평균·패턴·오더블록…)와
-    # 봉이 어긋난다. 여기서 먼저 집계한 뒤 지표를 계산해야 전부 그 봉 기준이 된다.
-    if tf != "D":
-        def _key(dstr):
-            if tf == "W":
-                y, w, _ = date(int(dstr[:4]), int(dstr[5:7]), int(dstr[8:10])).isocalendar()
-                return f"{y}-W{w:02d}"
-            return dstr[:7]
-
-        agg, order = {}, []
-        for i, dstr in enumerate(o["dates"]):
-            k = _key(dstr)
-            if k not in agg:
-                agg[k] = {"d": dstr, "o": o["open"][i], "h": o["high"][i],
-                          "l": o["low"][i], "c": o["close"][i], "v": o["volume"][i]}
-                order.append(k)
-            else:
-                b = agg[k]
-                b["h"] = max(b["h"], o["high"][i])
-                b["l"] = min(b["l"], o["low"][i])
-                b["c"] = o["close"][i]
-                b["v"] += o["volume"][i]
-                b["d"] = dstr
-        o = {**o,
-             "dates": [agg[k]["d"] for k in order],
-             "open": [agg[k]["o"] for k in order],
-             "high": [agg[k]["h"] for k in order],
-             "low": [agg[k]["l"] for k in order],
-             "close": [agg[k]["c"] for k in order],
-             "volume": [agg[k]["v"] for k in order],
-             "tf": tf}
+    o = _resample(o, tf)
 
     # --- 옵션: 벤치마크 지수 (Minervini RS용). 실패해도 차트는 떠야 한다 ---
     bench = None
@@ -408,6 +424,17 @@ def full(ticker: str = Query(..., min_length=1, max_length=12),
     except Exception as e:  # noqa: BLE001
         payload["estimates"] = {"available": False, "reason": f"추정실적 조회 실패: {e}"}
 
+    # --- 옵션: Bulkowski 패턴 (chart_patterns) ---
+    # 지표와 같은 봉(재집계 후)으로 돌려야 오버레이 좌표가 맞는다. 벤치마크는
+    # 위에서 이미 받아둔 걸 재사용한다 — 국면 판정에만 쓰므로 없으면 없는 대로.
+    try:
+        payload["bulkowski"] = cpb.detect(
+            o["dates"], o["open"], o["high"], o["low"], o["close"], o["volume"],
+            tf=tf, recent=cpb.DEFAULT_RECENT, benchmark_close=bench)
+    except Exception as e:  # noqa: BLE001
+        payload["bulkowski"] = {"available": False,
+                                "reason": f"패턴 탐지 실패: {e}", "hits": []}
+
     # --- 옵션: 신용잔고 (bld 미확정 -> 항상 비활성) ---
     try:
         payload["credit"] = loader.get_credit_balance(ticker, days=days)
@@ -423,6 +450,59 @@ def full(ticker: str = Query(..., min_length=1, max_length=12),
         pass
 
     return JSONResponse(payload)
+
+
+# ---------------------------------------------------------------------------
+# Bulkowski 패턴 (chart_patterns)
+# ---------------------------------------------------------------------------
+@router.get("/patterns")
+def patterns(ticker: str = Query(..., min_length=1, max_length=12),
+             days: int = Query(1250, ge=60, le=6000),
+             tf: str = Query("D", pattern="^[DWM]$"),
+             recent: int = Query(cpb.DEFAULT_RECENT, ge=1, le=400),
+             pattern: str = Query("", description="쉼표구분 pid. 비우면 전체")):
+    """Bulkowski 73패턴 탐지 (차트 오버레이용).
+
+    `/full` 에도 기본값(recent=20)으로 같이 실려 나간다. 이 엔드포인트는
+    사용자가 탐색 구간을 바꿀 때 OHLCV 를 다시 받지 않고 재탐지하기 위한 것이다
+    (loader 가 TTL 300초 캐시를 물고 있어 재조회 비용이 거의 없다).
+    """
+    if not cpb.available():
+        raise HTTPException(status_code=503,
+                            detail=f"chart_patterns 없음: {cpb.import_error()}")
+    try:
+        o = loader.get_ohlcv(ticker, days=days)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"OHLCV 조회 실패({ticker}): {e}") from e
+
+    o = _resample(o, tf)
+    try:
+        bench = loader.get_benchmark_close(o["dates"],
+                                           market=o.get("market") or "KOSPI",
+                                           wait=False)
+    except Exception:  # noqa: BLE001
+        bench = None
+
+    pids = [x.strip() for x in pattern.split(",") if x.strip()] or None
+    res = cpb.detect(o["dates"], o["open"], o["high"], o["low"], o["close"],
+                     o["volume"], tf=tf, recent=recent, pids=pids,
+                     benchmark_close=bench)
+    return {"ticker": ticker, "name": o.get("name"), **res}
+
+
+@router.get("/patterns/catalog")
+def patterns_catalog():
+    """구현된 패턴 목록 (프론트 필터용)."""
+    return {"available": cpb.available(), "patterns": cpb.pattern_catalog()}
+
+
+@router.get("/pattern/{pid}")
+def pattern_detail(pid: str):
+    """책의 식별규칙·매매전술 원문."""
+    res = cpb.pattern_detail(pid)
+    if not res.get("available"):
+        raise HTTPException(status_code=404, detail=res.get("reason", "없음"))
+    return res
 
 
 # ---------------------------------------------------------------------------
