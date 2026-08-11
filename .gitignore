@@ -9,6 +9,10 @@ __pycache__/
 .chart_cache/
 .DS_Store
 
+# 로컬 개발 설정 (preview_start 용 launch.json). publish_chart.py 가 `git add -A`
+# 를 하므로 무시해두지 않으면 배포 커밋에 딸려 들어간다.
+.claude/
+
 # 패턴 스크리너 시세 캐시 (chart_patterns/ohlcv.db 는 415MB). 재생성 가능하므로
 # 커밋하지 않는다 — `python -m chart_patterns.ohlcv --market ALL --days 400`.
 *.db

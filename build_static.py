@@ -213,13 +213,36 @@ def kr_collect_pykrx(limit=None, workers=6):
     log(f"[KR] 유니버스 {len(uni)}종목 (KIND)")
 
     # 실제 거래일은 코스피 지수 시계열에서 얻는다(휴장일이 자동으로 빠진다).
+    #
+    # 이 한 줄에 예외 처리가 없어서 빌드 전체가 죽은 적이 있다(2026-08-11).
+    # pykrx 는 지수 OHLCV 를 받은 뒤 `df.columns.name = get_index_ticker_name(...)`
+    # 로 이름을 붙이는데, 그 지수명 표 조회가 KRX 응답 이상으로 실패하면
+    # KeyError('지수명') 가 데이터와 무관하게 터진다. 데이터 자체는 멀쩡한데
+    # 이름 붙이는 부수 단계에서 죽는 셈이라, 재시도 후 종목 하나의 일봉
+    # 날짜 인덱스로 폴백한다(지수명 표를 타지 않는 경로).
     end = datetime.now()
     start = end - timedelta(days=int(BARS * 1.7))
-    idx = stock.get_index_ohlcv(start.strftime("%Y%m%d"),
-                                end.strftime("%Y%m%d"), "1001")
-    days = [d.strftime("%Y%m%d") for d in idx.index][-BARS:]
+    sd, ed = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+    days = []
+    for attempt in range(3):
+        try:
+            idx = stock.get_index_ohlcv(sd, ed, "1001")
+            days = [d.strftime("%Y%m%d") for d in idx.index][-BARS:]
+            if days:
+                break
+        except Exception as e:  # noqa: BLE001
+            log(f"[KR] 거래일(지수) 조회 실패 {attempt + 1}/3: {e}")
+            time.sleep(2 * (attempt + 1))
     if not days:
-        log("[KR] 거래일 조회 실패")
+        log("[KR] 지수 경로 포기 → 삼성전자 일봉 날짜로 폴백")
+        try:
+            df = stock.get_market_ohlcv_by_date(sd, ed, "005930")
+            days = [d.strftime("%Y%m%d") for d in df.index][-BARS:]
+        except Exception as e:  # noqa: BLE001
+            log(f"[KR] 폴백도 실패: {e}")
+    if not days:
+        log("[KR] 거래일 조회 실패 — KR 수집을 건너뜁니다")
         return [], {}
     log(f"[KR] 거래일 {len(days)}일: {days[0]} ~ {days[-1]}, 병렬 {workers}")
 
@@ -925,43 +948,45 @@ def build_one(code, name, market, s, with_supply=False, long_data=None, fin=None
             log(f"  ! 패턴 실패 {code}: {e}")
 
     # --- 장기 시계열 (주/월봉) + 월말 시가총액 ---
+    # 시총 하한 미달 종목은 long_data 가 없다. 그래도 일봉 신호등/MTF 는 나와야
+    # 하므로 아래 계산을 이 블록 안에 두지 않는다 (주/월 칸만 비게 된다).
     if long_data:
         out["w"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5])]
                     for b in long_data.get("weekly", [])]
         out["m"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5]), int(b[6])]
                     for b in long_data.get("monthly", [])]
 
-        # --- 신호등 + MTF (일/주/월) ---
-        # Minervini 템플릿은 일봉 지표라 주/월봉에 50/150/200 을 그대로 쓰면
-        # MA200 이 200주(4년)·200개월(16년)이 되어 뜻이 달라진다. 라이브
-        # /signals 와 같은 환산을 쓴다: 일 50/150/200,22 → 주 10/30/40,4 → 월 3/7/10,1
-        wc = [b[4] for b in long_data.get("weekly", [])]
-        mc = [b[4] for b in long_data.get("monthly", [])]
-        sig = {"D": _mnv_light(c, 260, 50, 150, 200, 22)}
-        if wc:
-            sig["W"] = _mnv_light(wc, 52, 10, 30, 40, 4)
-        if mc:
-            sig["M"] = _mnv_light(mc, 12, 3, 7, 10, 1)
-        out["signals"] = {k: x for k, x in sig.items() if x}
+    # --- 신호등 + MTF (일 / 주 / 월) ---
+    # Minervini 템플릿은 일봉 지표라 주/월봉에 50/150/200 을 그대로 쓰면 MA200 이
+    # 200주(4년)·200개월(16년)이 되어 뜻이 달라진다. 라이브 /signals 와 같은
+    # 환산을 쓴다: 일 50/150/200,22 → 주 10/30/40,4 → 월 3/7/10,1
+    wb = (long_data or {}).get("weekly") or []
+    mb = (long_data or {}).get("monthly") or []
+    sig = {"D": _mnv_light(c, 260, 50, 150, 200, 22)}
+    if wb:
+        sig["W"] = _mnv_light([b[4] for b in wb], 52, 10, 30, 40, 4)
+    if mb:
+        sig["M"] = _mnv_light([b[4] for b in mb], 12, 3, 7, 10, 1)
+    sig = {k: x for k, x in sig.items() if x}
+    if sig:
+        out["signals"] = sig
 
-        mtf = {}
-        for key, bars in (("D", None), ("W", long_data.get("weekly")),
-                          ("M", long_data.get("monthly"))):
-            try:
-                if key == "D":
-                    t = ind.timeframe_signals(h, lo, c, v)
-                else:
-                    if not bars or len(bars) < 30:
-                        continue
-                    t = ind.timeframe_signals([b[2] for b in bars],
-                                              [b[3] for b in bars],
-                                              [b[4] for b in bars],
-                                              [b[5] for b in bars])
+    mtf = {}
+    for key, bars in (("D", None), ("W", wb), ("M", mb)):
+        try:
+            if key == "D":
+                t = ind.timeframe_signals(h, lo, c, v)
+            else:
+                if len(bars) < 30:
+                    continue
+                t = ind.timeframe_signals([b[2] for b in bars], [b[3] for b in bars],
+                                          [b[4] for b in bars], [b[5] for b in bars])
+            if t.get("available"):
                 mtf[key] = t
-            except Exception:  # noqa: BLE001
-                continue
-        if mtf:
-            out["mtf"] = mtf
+        except Exception:  # noqa: BLE001
+            continue
+    if mtf:
+        out["mtf"] = mtf
 
     # --- DART 연간 재무 (밸류에이션 밴드용) ---
     if fin:
