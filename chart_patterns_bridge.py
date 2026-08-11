@@ -133,12 +133,20 @@ def _date_at(dates: Sequence[str], i: Optional[int]) -> Optional[str]:
 def detect(dates: Sequence[str], open_, high, low, close, volume,
            tf: str = "D", recent: int = DEFAULT_RECENT,
            pids: Optional[Sequence[str]] = None,
-           benchmark_close: Optional[Sequence[float]] = None) -> dict:
+           benchmark_close: Optional[Sequence[float]] = None,
+           regime: Optional[str] = None,
+           with_notes: bool = True) -> dict:
     """화면에 그려진 봉에 대해 Bulkowski 패턴을 탐지해 오버레이용으로 반환.
 
     tf 는 호출부가 이미 재집계해서 넘긴 봉의 단위다(D/W/M). 일봉일 때만
     탐지기 내부의 주봉 재집계를 허용한다 — 주봉 화면에서 또 주봉으로 묶으면
     사실상 월봉이 되어 화면의 봉과 좌표가 어긋난다.
+
+    regime 을 직접 주면 벤치마크 판정을 건너뛴다. 정적 빌드(build_static.py)는
+    종목마다 지수를 다시 받을 수 없고, 어차피 시장 국면은 종목별로 다르지 않아
+    시장당 한 번 구해서 넘기는 쪽이 맞다.
+    with_notes=False 면 탐지기 내부 메모를 뺀다 — 3,000종목 JSON 에서는
+    용량만 차지하고 화면에 쓰지 않는다.
     """
     if not available():
         return {"available": False, "reason": import_error(), "hits": []}
@@ -160,7 +168,7 @@ def detect(dates: Sequence[str], open_, high, low, close, volume,
         dates = list(dates)[k:]
     n = len(c)
 
-    regime = _regime(benchmark_close)
+    regime = regime if regime in ("bull", "bear") else _regime(benchmark_close)
 
     # 일봉일 때만 dates 를 넘긴다. dates=None 이면 detectors.run 이 주봉 탐지기를
     # 건너뛴다 — 주/월봉 화면에서는 이미 집계된 봉을 그대로 일봉처럼 다룬다.
@@ -244,7 +252,7 @@ def detect(dates: Sequence[str], open_, high, low, close, volume,
             "score": sc,
             "book": {"perf": det["book_perf"], "fail": det["book_fail"],
                      "rank": det["book_rank"], "regime": regime},
-            "notes": _jsonable(x.notes),
+            **({"notes": _jsonable(x.notes)} if with_notes else {}),
         })
 
     rows.sort(key=lambda r: (-r["score"], r["pid"]))

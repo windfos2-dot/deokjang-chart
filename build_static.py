@@ -35,6 +35,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 import chart_indicators as ind
+import chart_patterns_bridge as cpb
 # import 만으로 .env 를 로드해 KRX 로그인이 걸린다(한국 지수 조회에 필요).
 import chart_data_loader as loader  # noqa: F401
 
@@ -818,7 +819,51 @@ def collect_indices():
 # ---------------------------------------------------------------------------
 # 종목 1개 -> JSON
 # ---------------------------------------------------------------------------
-def build_one(code, name, market, s, with_supply=False, long_data=None, fin=None):
+def market_regime(series_map, limit=800):
+    """유니버스 중앙값의 200일선 위/아래 → bull / bear.
+
+    책 통계가 강세/약세로 갈리므로 Bulkowski 점수에 필요하다. 종목마다 지수를
+    다시 받을 수는 없고 국면은 종목별로 다르지 않으니, 스크리너와 같은 방식으로
+    시장당 한 번만 구해서 build_one 에 넘긴다.
+    """
+    vals = []
+    for s in list(series_map.values())[:limit]:
+        c = s.get("close") or []
+        if len(c) < 210:
+            continue
+        ma = float(np.mean(c[-200:]))
+        if ma > 0:
+            vals.append(c[-1] / ma - 1.0)
+    if not vals:
+        return "bull"
+    return "bull" if float(np.median(vals)) > 0 else "bear"
+
+
+def _mnv_light(closes, lookback, mf, mm, ms, rb):
+    """Minervini 추세템플릿 통과율 → 신호등 한 칸. 봉이 모자라면 None."""
+    if len(closes) < max(ms, 20) + 2:
+        return None
+    try:
+        mv = ind.minervini_trend_template(
+            closes, lookback=min(lookback, max(len(closes) - 1, 2)),
+            ma_fast=mf, ma_mid=mm, ma_slow=ms, rise_bars=rb)
+    except Exception:  # noqa: BLE001
+        return None
+    latest = (mv or {}).get("latest")
+    if not latest:
+        return None
+    crit = [v for k, v in latest.items() if k.startswith("c") and v is not None]
+    if not crit:
+        return None
+    passed = sum(1 for v in crit if v)
+    ratio = passed / len(crit)
+    return {"passed": passed, "total": len(crit),
+            "light": "green" if ratio >= 0.75 else
+                     ("yellow" if ratio >= 0.5 else "red")}
+
+
+def build_one(code, name, market, s, with_supply=False, long_data=None, fin=None,
+              regime=None):
     dates = s["dates"][-BARS:]
     o = s["open"][-BARS:]; h = s["high"][-BARS:]
     lo = s["low"][-BARS:]; c = s["close"][-BARS:]; v = s["volume"][-BARS:]
@@ -861,12 +906,62 @@ def build_one(code, name, market, s, with_supply=False, long_data=None, fin=None
         "minervini": r["minervini"]["latest"],
     }
 
+    # --- Bulkowski 패턴 ---
+    # 추가 네트워크 호출이 없다. 위에서 이미 받은 일봉만으로 계산되므로 빌드
+    # 시간에 사실상 영향이 없다(종목당 수십 ms). 책 데이터가 없는 환경에서는
+    # available() 이 False 라 조용히 빠진다.
+    # notes 는 화면에 안 쓰면서 용량만 차지해서 뺀다.
+    if cpb.available():
+        try:
+            bk = cpb.detect(dates, o, h, lo, c, v, tf="D",
+                            recent=cpb.DEFAULT_RECENT, regime=regime,
+                            with_notes=False)
+            # 히트가 0건이어도 키는 넣는다. 프론트가 '탐지했는데 없음' 과
+            # '이 필드가 아예 없는 구버전 빌드' 를 구분해야 하기 때문이다.
+            if bk.get("available"):
+                out["bulkowski"] = {"regime": bk["regime"], "recent": bk["recent"],
+                                    "hits": bk["hits"]}
+        except Exception as e:  # noqa: BLE001
+            log(f"  ! 패턴 실패 {code}: {e}")
+
     # --- 장기 시계열 (주/월봉) + 월말 시가총액 ---
     if long_data:
         out["w"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5])]
                     for b in long_data.get("weekly", [])]
         out["m"] = [[b[0]] + [r2(x, px_nd) for x in b[1:5]] + [int(b[5]), int(b[6])]
                     for b in long_data.get("monthly", [])]
+
+        # --- 신호등 + MTF (일/주/월) ---
+        # Minervini 템플릿은 일봉 지표라 주/월봉에 50/150/200 을 그대로 쓰면
+        # MA200 이 200주(4년)·200개월(16년)이 되어 뜻이 달라진다. 라이브
+        # /signals 와 같은 환산을 쓴다: 일 50/150/200,22 → 주 10/30/40,4 → 월 3/7/10,1
+        wc = [b[4] for b in long_data.get("weekly", [])]
+        mc = [b[4] for b in long_data.get("monthly", [])]
+        sig = {"D": _mnv_light(c, 260, 50, 150, 200, 22)}
+        if wc:
+            sig["W"] = _mnv_light(wc, 52, 10, 30, 40, 4)
+        if mc:
+            sig["M"] = _mnv_light(mc, 12, 3, 7, 10, 1)
+        out["signals"] = {k: x for k, x in sig.items() if x}
+
+        mtf = {}
+        for key, bars in (("D", None), ("W", long_data.get("weekly")),
+                          ("M", long_data.get("monthly"))):
+            try:
+                if key == "D":
+                    t = ind.timeframe_signals(h, lo, c, v)
+                else:
+                    if not bars or len(bars) < 30:
+                        continue
+                    t = ind.timeframe_signals([b[2] for b in bars],
+                                              [b[3] for b in bars],
+                                              [b[4] for b in bars],
+                                              [b[5] for b in bars])
+                mtf[key] = t
+            except Exception:  # noqa: BLE001
+                continue
+        if mtf:
+            out["mtf"] = mtf
 
     # --- DART 연간 재무 (밸류에이션 밴드용) ---
     if fin:
@@ -938,9 +1033,12 @@ def main():
 
         if items:
             ok = 0
+            kr_regime = market_regime(series)
+            log(f"[KR] 시장 국면 {kr_regime} (Bulkowski 책 통계 선택 기준)")
             for i, (code, name, mkt, cap) in enumerate(items, 1):
                 doc = build_one(code, name, mkt, series[code],
-                                long_data=long_map.get(code), fin=fin_map.get(code))
+                                long_data=long_map.get(code), fin=fin_map.get(code),
+                                regime=kr_regime)
                 if not doc:
                     continue
                 with open(os.path.join(DATA, "KR", f"{code}.json"), "w",
@@ -961,8 +1059,11 @@ def main():
             series = us_collect(uni, keep=args.us_limit)
             namemap = dict(uni)
             ok = 0
+            us_regime = market_regime(series)
+            log(f"[US] 시장 국면 {us_regime} (Bulkowski 책 통계 선택 기준)")
             for i, (sym, sdata) in enumerate(series.items(), 1):
-                doc = build_one(sym, namemap.get(sym, sym), "US", sdata)
+                doc = build_one(sym, namemap.get(sym, sym), "US", sdata,
+                                regime=us_regime)
                 if not doc:
                     continue
                 with open(os.path.join(DATA, "US", f"{sym}.json"), "w",

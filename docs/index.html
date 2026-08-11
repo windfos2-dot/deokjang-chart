@@ -63,6 +63,35 @@
   .mt:hover:not(.on),.bp:hover:not(.on){background:#1b2432;color:var(--text)}
   .tf:hover:not(.on){background:#1b2432;color:var(--text)}
   #tfnote{color:#f5c77e;font-size:11px;padding:0 14px 4px}
+  /* Bulkowski 패턴 — 라이브(static/chart_live.html)와 같은 표기 규칙 */
+  #bulk{font-size:11.5px;padding:0 10px 8px;border-top:1px solid var(--border)}
+  #bulk .bhead{color:var(--muted);padding:6px 0 1px 2px}
+  .btag{display:inline-flex;align-items:center;gap:6px;background:#1b2432;
+        border:1px solid var(--border);border-radius:6px;padding:3px 8px;
+        margin:3px 4px 0 0;color:#c9d4e2;cursor:pointer;user-select:none}
+  .btag:hover{border-color:#5b6b80}
+  .btag.sel{border-color:#f5c77e;background:#2b2718}
+  .btag .dir{font-weight:700}
+  .btag .dir.up{color:var(--up)} .btag .dir.dn{color:var(--dn)}
+  .btag .sc{font-variant-numeric:tabular-nums;color:#f5c77e;font-weight:600}
+  .btag .st{font-size:10px;padding:0 5px;border-radius:4px;
+            border:1px solid var(--border);color:#9aa5b4}
+  .btag .st.bo{color:#4ade80;border-color:#17614e}
+  #bulkinfo{margin-top:7px;color:var(--muted);line-height:1.7;padding-left:2px}
+  #bulkinfo b{color:#c9d4e2;font-weight:600}
+  #bulkinfo .warn{color:#f5c77e}
+  /* 신호등 · MTF */
+  #tfgrid{display:flex;gap:10px;flex-wrap:wrap;padding:10px}
+  .tfcard{flex:1;min-width:150px;background:#0e131c;border:1px solid var(--border);
+          border-radius:8px;padding:9px 11px}
+  .tfcard h4{margin:0 0 6px;font-size:12px;font-weight:600}
+  .tfcard .row{display:flex;justify-content:space-between;font-size:11px;
+               color:var(--muted);padding:1px 0}
+  .tfcard .row b{color:var(--text);font-weight:600}
+  .lamp{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;
+        vertical-align:-1px}
+  .lamp.green{background:#4ade80} .lamp.yellow{background:#facc15}
+  .lamp.red{background:#f87171} .lamp.na{background:#4b5563}
   footer{padding:14px;color:var(--muted);font-size:11px;text-align:center;
          border-top:1px solid var(--border)}
 </style>
@@ -88,6 +117,7 @@
   <label><input type="checkbox" id="t-hma" checked> HMA(60)</label>
   <label><input type="checkbox" id="t-ich"> 이치모쿠</label>
   <label><input type="checkbox" id="t-pat" checked> ACP 패턴</label>
+  <label><input type="checkbox" id="t-bulk" checked> Bulkowski 패턴</label>
   <label><input type="checkbox" id="t-sr" checked> S/R + 돌파</label>
   <label><input type="checkbox" id="t-ob"> 오더블록</label>
   <label><input type="checkbox" id="t-div" checked> RSI 다이버전스</label>
@@ -99,7 +129,10 @@
   <div id="empty">종목을 검색하세요.</div>
   <div id="charts" style="display:none">
     <div class="panel"><div class="ptitle"><span>가격 · 이동평균 · 볼린저 · 패턴</span><span id="leg"></span></div>
-      <div id="main-chart" style="height:430px"></div><div id="patlist" style="padding:6px 10px"></div></div>
+      <div id="main-chart" style="height:430px"></div><div id="patlist" style="padding:6px 10px"></div>
+      <div id="bulk"></div></div>
+    <div class="panel" id="tf-panel"><div class="ptitle"><span>신호등 · 멀티타임프레임</span>
+      <span id="tf-note"></span></div><div id="tfgrid"></div></div>
     <div class="panel" id="band-panel">
       <div class="ptitle">
         <span>역사적 밸류에이션 밴드
@@ -196,6 +229,15 @@ const aaChart   = LightweightCharts.createChart($("#aa-chart"),   {...COMMON, he
 const bandChart = LightweightCharts.createChart($("#band-chart"), {...COMMON, height:200});
 const CHARTS = [mainChart, volChart, rsiChart, sqzChart, aaChart];
 
+// ⚠️ Bulkowski 구름대는 캔들보다 **먼저** 만들어야 뒤에 깔린다.
+// lightweight-charts 는 시리즈를 추가한 순서대로 그린다. 동적으로 addSeries 하면
+// 항상 캔들 위에 얹혀 캔들을 가린다. 히스토그램은 base~value 사이를 칠하므로
+// base=구간저가 / value=구간고가 로 두면 패턴 구간이 통째로 음영이 된다.
+const BULK_CLOUD_MAX = 14;
+const bulkClouds = Array.from({length: BULK_CLOUD_MAX}, () =>
+  mainChart.addHistogramSeries({priceScaleId:"right", base:0, color:"rgba(0,0,0,0)",
+                                priceLineVisible:false, lastValueVisible:false}));
+
 const candle = mainChart.addCandlestickSeries({
   upColor:"#e2445c", downColor:"#3b82f6", borderUpColor:"#e2445c",
   borderDownColor:"#3b82f6", wickUpColor:"#e2445c", wickDownColor:"#3b82f6"});
@@ -257,6 +299,7 @@ async function load(region, ticker){
   try{ d = await (await fetch(`data/${region}/${ticker}.json`)).json(); }
   catch(err){ alert("데이터 없음: "+ticker); return; }
   CUR = d;
+  BULK_SEL = 0;                       // 종목이 바뀌면 패턴 선택도 처음으로
   $("#empty").style.display="none"; $("#charts").style.display="block";
   dispatchEvent(new Event("resize"));   // 숨김 상태에서 만들어진 차트는 폭이 0이다
   render(d);
@@ -354,6 +397,8 @@ function render(src){
         `<span class="crit ${mv[k]?'y':'n'}">${mv[k]?'✓':'✗'} ${L[k]}</span>`).join("");
   } else $("#mnv").innerHTML="";
 
+  drawBulkowski(d, daily);
+  renderTF(d);
   applyToggles();
   renderBand();
   // autoSize 의 ResizeObserver 는 비동기라, 폭이 확정된 다음 프레임에 맞춘다
@@ -436,6 +481,148 @@ document.querySelectorAll(".bp").forEach(b=>b.addEventListener("click",()=>{
   document.querySelectorAll(".bp").forEach(x=>x.classList.toggle("on",x===b));
   BAND_Y=+b.dataset.y; renderBand();
 }));
+
+// ---- Bulkowski 패턴 ----------------------------------------------------
+// 좌표가 일봉 기준이라 일봉에서만 그린다(패턴/오더블록/S-R 과 같은 이유).
+// 구름은 선택된 패턴에만 — 히트가 9건씩 나오는 종목에서 전부 칠하면 음영이
+// 겹겹이 쌓여 형태가 되레 묻힌다.
+let bulkLines = [], bulkDyn = [], BULK_SEL = 0;
+
+function clearBulk(){
+  bulkLines.forEach(l=>{try{candle.removePriceLine(l)}catch(e){}}); bulkLines=[];
+  bulkDyn.forEach(s=>{try{mainChart.removeSeries(s)}catch(e){}}); bulkDyn=[];
+  bulkClouds.forEach(s=>s.setData([]));
+}
+const bpx = v => v==null ? "-" : (Math.abs(v)>=1000 ? Math.round(v).toLocaleString() : (+v).toFixed(2));
+const bpc = v => v==null ? "-" : (v>0?"+":"")+(+v).toFixed(1)+"%";
+
+function drawBulkowski(d, daily){
+  clearBulk();
+  const box = $("#bulk");
+  const bk = d.bulkowski;
+  // bk 자체가 없으면 패턴 필드 이전에 만들어진 데이터다 — 아무것도 알리지 않는다.
+  if(!bk){ box.innerHTML=""; return; }
+  if(!daily || !$("#t-bulk").checked || !(bk.hits||[]).length){
+    box.innerHTML = !daily
+      ? `<div class="bhead">Bulkowski 패턴 — 일봉에서만 표시합니다 `
+        + `<span style="color:var(--muted)">(좌표가 일봉 기준)</span></div>`
+      : ($("#t-bulk").checked
+         ? `<div class="bhead">Bulkowski 패턴 — 최근 ${bk.recent}봉 내 감지 없음 `
+           + `<span style="color:var(--muted)">(73패턴 탐색)</span></div>` : "");
+    return;
+  }
+  const hits = bk.hits;
+  if(BULK_SEL >= hits.length) BULK_SEL = 0;
+  const dates = d.dates;
+
+  // 구름대 (선택된 것만) — 높이는 꼭짓점이 아니라 구간의 실제 고가~저가.
+  // 혼·파이프는 꼭짓점 2개가 같은 높이라 점만 쓰면 밴드가 납작해진다.
+  const h = hits[BULK_SEL];
+  const idx = [];
+  for(let k=0;k<dates.length;k++) if(dates[k]>=h.start && dates[k]<=h.end) idx.push(k);
+  if(idx.length>=2){
+    let top=-Infinity, bot=Infinity;
+    idx.forEach(k=>{ if(d.h[k]>top) top=d.h[k]; if(d.l[k]<bot) bot=d.l[k]; });
+    if(top>bot){
+      const pad=(top-bot)*0.04; top+=pad; bot-=pad;
+      const rgb = h.direction==="up" ? "226,68,92" : "59,130,246";
+      bulkClouds[0].applyOptions({base:bot, color:`rgba(${rgb},0.16)`});
+      bulkClouds[0].setData(idx.map(k=>({time:dates[k], value:top})));
+    }
+  }
+
+  // 외곽선 — 전부. 선택된 것만 실선·굵게.
+  hits.slice(0, BULK_CLOUD_MAX).forEach((x,i)=>{
+    const pts=(x.points||[]).filter(p=>p[0]);
+    if(pts.length<2) return;
+    const sel=(i===BULK_SEL);
+    const s=mkLine({color: x.direction==="up"?"#e2445c":"#3b82f6",
+                    lineWidth: sel?2:1, lineStyle: sel?0:2});
+    s.setData(pts.map(p=>({time:p[0], value:p[1]})));
+    bulkDyn.push(s);
+  });
+
+  // 트리거·목표는 가격선으로. 측정룰이 먼 값을 내도 세로 스케일이 안 망가진다.
+  const lo=Math.min(...d.l), hi=Math.max(...d.h), pad=(hi-lo)*0.35;
+  const inRange = p => p!=null && p>=lo-pad && p<=hi+pad;
+  const tgtOff = h.target!=null && !inRange(h.target);
+  if(h.trigger) bulkLines.push(candle.createPriceLine({price:h.trigger,color:"#f5c77e",
+    lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"트리거"}));
+  if(h.target && !tgtOff) bulkLines.push(candle.createPriceLine({price:h.target,
+    color:"#a78bfa",lineWidth:1,lineStyle:3,axisLabelVisible:true,title:"목표"}));
+
+  const tags = hits.map((x,i)=>{
+    const up=x.direction==="up", bo=x.status==="breakout";
+    return `<span class="btag${i===BULK_SEL?" sel":""}" data-i="${i}">`
+      +`<span class="dir ${up?"up":"dn"}">${up?"▲":"▼"}</span>${x.name_kr}`
+      +`${x.scale==="W"?'<span style="color:var(--muted)">주봉</span>':""}`
+      +`<span class="st${bo?" bo":""}">${bo?"돌파":"형성중"}</span>`
+      +`<span class="sc">${x.score.toFixed(0)}</span></span>`;
+  }).join("");
+
+  const b=h.book||{}, regKr=b.regime==="bear"?"약세장":"강세장";
+  const dirKr=h.direction==="up"?"상승돌파":"하락돌파";
+  const bookLine = b.perf==null
+    ? `책 통계 없음`
+    : `책 통계(${regKr}·${dirKr}) 평균 <b>${bpc(b.perf)}</b>`
+      +` · 손익분기 실패율 <b>${b.fail==null?"-":b.fail.toFixed(1)+"%"}</b>`
+      +` · 순위 <b>${b.rank==null?"-":b.rank+"위"}</b>`;
+  const bits=[];
+  if(h.trigger) bits.push(`트리거 <b>${bpx(h.trigger)}</b>`
+    + (h.to_trigger_pct!=null?` <span style="color:var(--muted)">(현재가 대비 ${bpc(h.to_trigger_pct)})</span>`:""));
+  if(h.breakout_date) bits.push(`돌파 <b>${h.breakout_date}</b> @${bpx(h.breakout_px)}`
+    + ` <span style="color:var(--muted)">(이후 ${bpc(h.since_breakout_pct)})</span>`);
+  if(h.target) bits.push(`목표 <b>${bpx(h.target)}</b> (${bpc(h.upside_pct)})`
+    + (tgtOff?` <span class="warn">— 측정룰 값이 차트 범위 밖이라 선은 생략</span>`:""));
+  if(h.back_inside) bits.push(`<span class="warn">되돌림 — 돌파선 안으로 복귀</span>`);
+  if(h.target_reached) bits.push(`<span class="warn">목표가 이미 도달</span>`);
+
+  box.innerHTML = `<div class="bhead">Bulkowski 패턴 <span style="color:var(--muted)">`
+      +`73패턴 · 최근 ${bk.recent}봉 · ${hits.length}건 · 국면 ${bk.regime}</span></div>`
+    + tags
+    + `<div id="bulkinfo"><b>${h.name_kr}</b> <span style="color:var(--muted)">${h.name_en}</span>`
+    + ` · ${h.start}~${h.end} <span style="color:var(--muted)">(${h.bars}봉 · 높이 ${h.height_pct}%)</span><br>`
+    + (bits.length?bits.join(" · ")+"<br>":"")
+    + bookLine + ` · 형태적합 <b>${h.quality}</b> · 종합 <b>${h.score}</b>점</div>`;
+
+  box.querySelectorAll(".btag").forEach(el=>el.addEventListener("click",()=>{
+    BULK_SEL=+el.dataset.i; drawBulkowski(d, daily);
+  }));
+}
+
+// ---- 신호등 · 멀티타임프레임 -------------------------------------------
+function renderTF(d){
+  const sig=d.signals||{}, mtf=d.mtf||{};
+  const keys=["D","W","M"], kr={D:"일봉",W:"주봉",M:"월봉"};
+  if(!Object.keys(sig).length && !Object.keys(mtf).length){
+    $("#tf-panel").style.display="none"; return;
+  }
+  $("#tf-panel").style.display="";
+  $("#tf-note").textContent =
+    "추세등 = Minervini 추세템플릿 통과율 (주/월봉은 이동평균 기간을 환산해 적용)";
+  $("#tfgrid").innerHTML = keys.map(k=>{
+    const s=sig[k], m=mtf[k]||{};
+    if(!s && !m.available) return "";
+    const rows=[];
+    if(s) rows.push(["추세(Minervini)", `${s.passed}/${s.total} 조건`]);
+    if(m.close!=null)
+      rows.push(["종가", Number(m.close).toLocaleString()]);
+    if(m.chg_pct!=null)
+      rows.push(["직전 대비",
+        `<span class="${m.chg_pct>=0?"up":"dn"}">${m.chg_pct>0?"+":""}${(+m.chg_pct).toFixed(2)}%</span>`]);
+    if(m.ma20!=null)
+      rows.push(["20MA 대비", `${m.above_ma20?"위":"아래"} `
+        + `<span style="color:var(--muted)">(${Math.round(m.ma20).toLocaleString()})</span>`]);
+    if(m.rsi!=null) rows.push(["RSI(14)", `${(+m.rsi).toFixed(1)} ${m.rsi_state||""}`]);
+    if(m.squeeze_dir) rows.push(["스퀴즈", m.squeeze_dir]);
+    const vb = m.verdict
+      ? `<span class="badge ${m.verdict==="강세"?"ok":(m.verdict==="약세"?"no":"")}"
+              style="font-size:10.5px">${m.verdict}</span>` : "";
+    return `<div class="tfcard"><h4><span class="lamp ${s?s.light:"na"}"></span>${kr[k]} ${vb}</h4>`
+      + rows.map(([a,b])=>`<div class="row"><span>${a}</span><b>${b}</b></div>`).join("")
+      + `</div>`;
+  }).join("");
+}
 
 function applyToggles(){
   MA.forEach(s=>s.applyOptions({visible:$("#t-ma").checked}));
