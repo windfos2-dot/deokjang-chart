@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 from collections import defaultdict
@@ -609,14 +610,25 @@ def dart_corp_map():
     import io
     import zipfile
     import xml.etree.ElementTree as ET
-    try:
-        with urllib.request.urlopen(
-                f"{DART_BASE}/corpCode.xml?crtfc_key={key}", timeout=90) as r:
-            raw = r.read()
-        z = zipfile.ZipFile(io.BytesIO(raw))
-        root = ET.fromstring(z.read(z.namelist()[0]).decode("utf-8"))
-    except Exception as e:  # noqa: BLE001
-        log(f"[DART] corp_code 실패: {e}")
+
+    # 3.6MB 한 방 다운로드라 연결이 한 번 끊기면 그걸로 끝이었다. 이 표가 비면
+    # 종목→corp_code 매핑이 없어 **전 종목 재무가 통째로 스킵**되고, 그 결과
+    # 밸류에이션 밴드(PER/PBR/POR/ROE)가 사이트에서 사라진다. 실제로 2026-08-11
+    # 빌드가 "Remote end closed connection" 한 줄로 1,351종목 밴드를 날렸다.
+    root = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(
+                    f"{DART_BASE}/corpCode.xml?crtfc_key={key}", timeout=90) as r:
+                raw = r.read()
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            root = ET.fromstring(z.read(z.namelist()[0]).decode("utf-8"))
+            break
+        except Exception as e:  # noqa: BLE001
+            log(f"[DART] corp_code 실패 {attempt + 1}/3: {e}")
+            time.sleep(3 * (attempt + 1))
+    if root is None:
+        log("[DART] ⚠ corp_code 확보 실패 — 밸류에이션 밴드가 전부 빠집니다")
         return {}
     m = {}
     for c in root.iter("list"):
@@ -644,16 +656,45 @@ def dart_financials(tickers, years=LONG_YEARS, workers=6):
     rev_map = {c: t for t, c in pairs}
     out = defaultdict(dict)
 
+    # DART 는 짧은 시간에 몰아치면 연결을 그냥 끊는다(RemoteDisconnected).
+    # 2026-08-11 에 2,112콜을 41초에 6병렬로 던졌다가 그때부터 전 호출이 거부됐고,
+    # 그 전에 받아둔 것도 연도가 군데군데 비어 쓸 수 없었다. 초당 호출 수를
+    # 묶어두고, 끊기면 물러섰다가 다시 시도한다.
+    stats = defaultdict(int)             # throttled / err / dropped 집계
+    _gate = threading.Semaphore(1)
+    _last = [0.0]
+    MIN_GAP = 0.12                       # 초당 8콜 상한
+
+    def _throttle():
+        with _gate:
+            gap = time.time() - _last[0]
+            if gap < MIN_GAP:
+                time.sleep(MIN_GAP - gap)
+            _last[0] = time.time()
+
     def fetch(args):
         yr, batch = args
         codes = ",".join(c for _, c in batch)
         url = (f"{DART_BASE}/fnlttMultiAcnt.json?crtfc_key={key}"
                f"&corp_code={codes}&bsns_year={yr}&reprt_code=11011")
-        try:
-            with urllib.request.urlopen(url, timeout=30) as r:
-                return yr, json.loads(r.read().decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001
-            return yr, {}
+        for attempt in range(3):
+            _throttle()
+            try:
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    d = json.loads(r.read().decode("utf-8", "replace"))
+                st = d.get("status")
+                # 020=사용한도 초과, 021=조회 제한. 물러서지 않으면 계속 막힌다.
+                if st in ("020", "021"):
+                    stats["throttled"] += 1
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                if st not in ("000", "013"):        # 013 = 데이터 없음(정상)
+                    stats["err"] += 1
+                return yr, d
+            except Exception:  # noqa: BLE001
+                stats["dropped"] += 1
+                time.sleep(1.5 * (attempt + 1))
+        return yr, {}
 
     jobs = [(yr, b) for yr in yrs for b in batches]
     log(f"[DART] {len(pairs):,}종목 × {len(yrs)}년 = {len(jobs):,} calls, 병렬 {workers}")
@@ -678,7 +719,16 @@ def dart_financials(tickers, years=LONG_YEARS, workers=6):
                     slot[fld] = val
             if done % 300 == 0:
                 log(f"[DART]   {done:,}/{len(jobs):,} ({time.time()-t0:.0f}s)")
-    log(f"[DART] 완료 {len(out):,}종목 ({time.time()-t0:.0f}s)")
+    # 조용히 반쪽짜리 재무를 넘기면 밴드가 최근 구간만 텅 빈 채로 그려진다.
+    # 실패 집계를 남겨서 '데이터가 원래 없는 것'과 '못 받은 것'을 구분한다.
+    if stats:
+        log(f"[DART] 실패 집계 — 한도 {stats['throttled']} / 오류 {stats['err']}"
+            f" / 연결끊김 {stats['dropped']}")
+    covered = sum(1 for v in out.values() if v)
+    log(f"[DART] 완료 {covered:,}/{len(pairs):,}종목 ({time.time()-t0:.0f}s)")
+    if covered < len(pairs) * 0.8:
+        log("[DART] ⚠ 커버리지 80% 미만 — 밸류에이션 밴드가 반쪽이 됩니다."
+            " 잠시 후 다시 시도하세요.")
     return out
 
 
